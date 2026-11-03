@@ -4,8 +4,8 @@ export const pct = (x: number) => `${x.toLocaleString("en-GB", { maximumFraction
 
 export function dur(s: number) {
   if (s < 60) return `${Math.round(s)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${Math.round(s % 60)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+  return `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
 }
 
 export function seconds(from: string, to?: string | null) {

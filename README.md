@@ -20,7 +20,9 @@ Or do it manually: `git init`, then run `claude` and type `/phase-1`.
 ```
 `SIFT_NO_OPEN=1 ./start.sh` skips opening the browser. Logs are in `data/logs/`. Ctrl-C stops both servers.
 
-Until Phase 2 the app runs against a **synthetic mailbox** of ~45,000 fictional messages (`data/mock_mailbox.sqlite`),
+`./start.sh --gmail` connects your real Gmail **read-only** (setup: `docs/google-setup.md`); `./start.sh --mock` or the default uses the synthetic mailbox. The two never share a database.
+
+By default the app runs against a **synthetic mailbox** of ~45,000 fictional messages (`data/mock_mailbox.sqlite`),
 badged "Synthetic data" everywhere. Classification is **rules only, no AI** until Phase 3.
 
 Tests: `cd backend && .venv/bin/python -m pytest` · frontend typecheck: `cd frontend && npm run typecheck`.

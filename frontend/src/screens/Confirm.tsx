@@ -126,13 +126,19 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
         Right before each batch, Sift re-checks every message: anything newly starred, replied to, or deleted is skipped. Nothing can be added.
       </div>
 
+      {!status.can_modify && (
+        <div className="notice notice-warn">
+          <strong>Read-only.</strong> Sift is connected with <code>gmail.readonly</code> and cannot change your mail.
+          You can review this plan; running it arrives with the "Enable cleanup" step in a later phase.
+        </div>
+      )}
       <label className="ack">
         <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
         I've reviewed this plan. {status.synthetic ? "Apply it to the synthetic mailbox." : "Apply it to my mailbox."}
       </label>
       <div className="row end">
         <button className="btn btn-ghost" onClick={() => go("recommendations")}>Edit selection</button>
-        <button className="btn btn-primary btn-lg" disabled={!ack || busy} onClick={approveAndRun}>
+        <button className="btn btn-primary btn-lg" disabled={!ack || busy || !status.can_modify} onClick={approveAndRun}>
           {busy ? "Starting…" : `Approve and run ${n(thisRun)} ${thisRun === 1 ? "change" : "changes"}`}
         </button>
       </div>

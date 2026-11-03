@@ -12,7 +12,7 @@ import time
 from .analysis import run_analysis
 from .classifier.base import Classifier
 from .db import Database, now_iso
-from .providers.base import MailProvider, MessageMeta, ProviderError
+from .providers.base import MailReader, MessageMeta, ProviderError
 from .retry import RetryPolicy
 
 PAGE_SIZE = 500
@@ -45,7 +45,7 @@ ON CONFLICT(id) DO UPDATE SET labels=excluded.labels, in_inbox=excluded.in_inbox
 
 
 class Scanner:
-    def __init__(self, db: Database, provider: MailProvider, classifier: Classifier,
+    def __init__(self, db: Database, provider: MailReader, classifier: Classifier,
                  retry: RetryPolicy | None = None, page_size: int = PAGE_SIZE, meta_batch: int = META_BATCH):
         self.db = db
         self.provider = provider
@@ -55,15 +55,17 @@ class Scanner:
         self.meta_batch = meta_batch
 
     # -- scan records ---------------------------------------------------------
-    def start(self) -> int:
-        """Begin a fresh scan. Local message cache is rebuilt from the provider."""
+    def start(self, max_per_phase: int | None = None) -> int:
+        """Begin a fresh scan. Local message cache is rebuilt from the provider.
+        `max_per_phase` caps how many Sent and how many Inbox messages are read (test scans)."""
         with self.db.tx() as c:
             c.execute("DELETE FROM messages")
             c.execute("DELETE FROM sender_groups")
             c.execute("DELETE FROM recommendations")
             cur = c.execute(
-                "INSERT INTO scans(status,phase,started_at,updated_at,checkpoint) VALUES ('running','sent',?,?,?)",
-                (now_iso(), now_iso(), json.dumps({"phase": "sent", "page_token": None})))
+                "INSERT INTO scans(status,phase,started_at,updated_at,checkpoint,max_per_phase) "
+                "VALUES ('running','sent',?,?,?,?)",
+                (now_iso(), now_iso(), json.dumps({"phase": "sent", "page_token": None}), max_per_phase))
             return cur.lastrowid
 
     def resumable(self) -> dict | None:
@@ -101,35 +103,56 @@ class Scanner:
         """Run (or resume) a scan to completion, cancellation or failure. Returns final status."""
         t0 = time.monotonic()
         with self.db.connect() as c:
-            row = c.execute("SELECT checkpoint, elapsed_s FROM scans WHERE id=?", (scan_id,)).fetchone()
+            row = c.execute("SELECT checkpoint, elapsed_s, max_per_phase FROM scans WHERE id=?", (scan_id,)).fetchone()
         cp = json.loads(row["checkpoint"])
+        cap = row["max_per_phase"]
         base_elapsed = row["elapsed_s"]
         user = self.provider.account_email()
 
         with self.db.connect() as c:  # counters survive resume
             seen_ids = {r[0] for r in c.execute("SELECT id FROM messages")}
             senders = {r[0] for r in c.execute("SELECT DISTINCT from_addr FROM messages WHERE is_sent=0")}
+            per_phase = {"sent": c.execute("SELECT COUNT(*) FROM messages WHERE is_sent=1").fetchone()[0],
+                         "inbox": c.execute("SELECT COUNT(*) FROM messages WHERE is_sent=0").fetchone()[0]}
+        start_count = len(seen_ids)
+        est_total = None
 
         def elapsed() -> float:
             return round(base_elapsed + time.monotonic() - t0, 1)
+
+        def throughput() -> tuple[float | None, float | None]:
+            """Messages/second measured in this session, and the estimated seconds remaining."""
+            secs = time.monotonic() - t0
+            done = len(seen_ids) - start_count
+            if secs < 1 or done <= 0:
+                return None, None
+            rate = done / secs
+            left = max(0, (est_total or 0) - len(seen_ids))
+            return round(rate, 2), round(left / rate, 0)
 
         def note_retry(attempt: int, e: Exception) -> None:
             self._error(scan_id, f"retry {attempt}: {e}")
 
         try:
             if cp.get("phase") in PHASES:
-                if cp["phase"] == "sent" and cp.get("page_token") is None:
-                    est = sum(self.retry.call(lambda l=l: self.provider.count_label(l), note_retry)
-                              for l in LABEL_FOR.values())
-                    self._update(scan_id, total_estimate=est)
+                # Label names let protection rules like "Work" resolve to Gmail's label ids.
+                self.db.set_setting("labels.map", self.retry.call(self.provider.label_names, note_retry))
+                counts = [self.retry.call(lambda l=l: self.provider.count_label(l), note_retry)
+                          for l in LABEL_FOR.values()]
+                est_total = sum(min(n, cap) if cap else n for n in counts)
+                self._update(scan_id, total_estimate=est_total)
                 for phase in PHASES[PHASES.index(cp["phase"]):]:
                     token = cp.get("page_token") if phase == cp["phase"] else None
                     self._update(scan_id, phase=phase)
                     while True:
                         if self._cancelled(scan_id):
                             raise ScanCancelled()
+                        if cap is not None and per_phase[phase] >= cap:
+                            break
                         page = self.retry.call(lambda: self.provider.list_message_ids(
                             LABEL_FOR[phase], token, self.page_size), note_retry)
+                        if cap is not None:
+                            page.ids = page.ids[:cap - per_phase[phase]]
                         for i in range(0, len(page.ids), self.meta_batch):
                             if self._cancelled(scan_id):
                                 raise ScanCancelled()
@@ -140,10 +163,13 @@ class Scanner:
                                 for m in metas:
                                     if m.id not in seen_ids:
                                         seen_ids.add(m.id)
+                                        per_phase[phase] += 1
                                         if "SENT" not in m.labels:
                                             senders.add(m.from_addr.lower())
+                                rate, eta = throughput()
                                 c.execute("UPDATE scans SET messages_scanned=?, senders_discovered=?, elapsed_s=?, "
-                                          "updated_at=? WHERE id=?", (len(seen_ids), len(senders), elapsed(), now_iso(), scan_id))
+                                          "rate_mps=?, eta_s=?, updated_at=? WHERE id=?",
+                                          (len(seen_ids), len(senders), elapsed(), rate, eta, now_iso(), scan_id))
                         token = page.next_page_token
                         # checkpoint only after the whole page is stored
                         self._update(scan_id, checkpoint=json.dumps({"phase": phase, "page_token": token}))
@@ -151,7 +177,7 @@ class Scanner:
                             break
                 cp = {"phase": "analyse"}
                 self._update(scan_id, checkpoint=json.dumps(cp))
-            self._update(scan_id, phase="analyse", elapsed_s=elapsed())
+            self._update(scan_id, phase="analyse", elapsed_s=elapsed(), eta_s=None)
             res = run_analysis(self.db, self.classifier, user, scan_id)
             self._update(scan_id, status="completed", phase="done", finished_at=now_iso(), elapsed_s=elapsed(),
                          senders_discovered=res["senders"], categories_detected=res["categories"],

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from .db import Database, now_iso
 from .plans import verify_frozen
 from .protection import load_context, protection_reason
-from .providers.base import MailProvider, MessageMeta, ProviderError
+from .providers.base import MailReader, MailWriter, MessageMeta, ProviderError
 from .retry import RetryPolicy
 
 CHUNK = 500  # <= Gmail's 1,000-id batchModify limit
@@ -31,16 +31,23 @@ def unlocked(db: Database) -> bool:
 
 
 class Executor:
-    def __init__(self, db: Database, provider: MailProvider, first_run_cap: int = 50,
+    def __init__(self, db: Database, reader: MailReader, writer: MailWriter | None, first_run_cap: int = 50,
                  retry: RetryPolicy | None = None, chunk: int = CHUNK):
         self.db = db
-        self.provider = provider
+        self.provider = reader   # fresh reads for revalidation and confirmation
+        self.writer = writer     # None while the account is read-only: nothing can be changed
         self.first_run_cap = first_run_cap
         self.retry = retry or RetryPolicy()
-        self.chunk = min(chunk, provider.max_modify_batch)
+        self.chunk = min(chunk, writer.max_modify_batch if writer else CHUNK)
+
+    def _require_writer(self) -> MailWriter:
+        if self.writer is None:
+            raise ExecutionError("cleanup is not enabled: this account is connected read-only")
+        return self.writer
 
     # -- run records ----------------------------------------------------------
     def create_run(self, plan_id: int) -> int:
+        self._require_writer()
         with self.db.tx() as c:
             p = c.execute("SELECT status FROM plans WHERE id=?", (plan_id,)).fetchone()
             if p is None:
@@ -65,6 +72,7 @@ class Executor:
         return run_id
 
     def create_restore(self, source_run_id: int) -> int:
+        self._require_writer()
         with self.db.tx() as c:
             src = c.execute("SELECT * FROM runs WHERE id=?", (source_run_id,)).fetchone()
             if src is None or src["kind"] != "execute":
@@ -127,7 +135,7 @@ class Executor:
         ctx = load_context(self.db, self.provider.account_email())
         status = "completed"
         try:
-            label_id = self.retry.call(lambda: self.provider.ensure_label(run["label_name"]))
+            label_id = self.retry.call(lambda: self.writer.ensure_label(run["label_name"]))
             self._set(run_id, label_id=label_id)
             with self.db.connect() as c:
                 self._audit(c, run_id, plan_id, None, "ensure_label", None, None, "confirmed",
@@ -229,21 +237,21 @@ class Executor:
             self._set(run_id, current_op=f"archiving {len(to_archive)} messages")
             self._bump(run_id, attempted=len(to_archive))
             try:
-                self.retry.call(lambda: self.provider.batch_modify(to_archive, add=[label_id], remove=["INBOX"]))
+                self.retry.call(lambda: self.writer.batch_modify(to_archive, add=[label_id], remove=["INBOX"]))
             except ProviderError as e:
                 errors.update({m: str(e) for m in to_archive})
         if to_trash:
             self._set(run_id, current_op=f"moving {len(to_trash)} messages to Trash")
             self._bump(run_id, attempted=len(to_trash))
             try:
-                self.retry.call(lambda: self.provider.batch_modify(to_trash, add=[label_id], remove=[]))
+                self.retry.call(lambda: self.writer.batch_modify(to_trash, add=[label_id], remove=[]))
             except ProviderError as e:
                 errors.update({m: str(e) for m in to_trash})
             for mid in to_trash:
                 if mid in errors:
                     continue
                 try:
-                    self.retry.call(lambda: self.provider.trash(mid))
+                    self.retry.call(lambda: self.writer.trash(mid))
                 except ProviderError as e:
                     errors[mid] = str(e)
 
@@ -316,13 +324,13 @@ class Executor:
                 for mid, action in pending:
                     if action == "trash" and "TRASH" in before[mid].labels:
                         try:
-                            self.retry.call(lambda: self.provider.untrash(mid))
+                            self.retry.call(lambda: self.writer.untrash(mid))
                         except ProviderError as e:
                             errors[mid] = str(e)
                 ids = [mid for mid, _ in pending if mid not in errors]
                 if ids:
                     try:
-                        self.retry.call(lambda: self.provider.batch_modify(ids, add=["INBOX"],
+                        self.retry.call(lambda: self.writer.batch_modify(ids, add=["INBOX"],
                                                                            remove=[label_id] if label_id else []))
                     except ProviderError as e:
                         errors.update({m: str(e) for m in ids})

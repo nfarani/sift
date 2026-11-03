@@ -29,7 +29,10 @@ CREATE TABLE IF NOT EXISTS scans (
     errors             INTEGER NOT NULL DEFAULT 0,
     error_log          TEXT NOT NULL DEFAULT '[]',
     checkpoint         TEXT NOT NULL DEFAULT '{}',
-    cancel_requested   INTEGER NOT NULL DEFAULT 0
+    cancel_requested   INTEGER NOT NULL DEFAULT 0,
+    max_per_phase      INTEGER,                 -- test-scan cap (NULL = full scan)
+    rate_mps           REAL,                    -- measured messages/second
+    eta_s              REAL                     -- estimated seconds remaining at that rate
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -197,6 +200,15 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as c:
             c.executescript(SCHEMA)
+            self._migrate(c)
+
+    @staticmethod
+    def _migrate(c: sqlite3.Connection) -> None:
+        """Add columns introduced after a database was first created."""
+        cols = {r[1] for r in c.execute("PRAGMA table_info(scans)")}
+        for name, decl in (("max_per_phase", "INTEGER"), ("rate_mps", "REAL"), ("eta_s", "REAL")):
+            if name not in cols:
+                c.execute(f"ALTER TABLE scans ADD COLUMN {name} {decl}")
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -245,4 +257,4 @@ class Database:
         with self.tx() as c:
             for t in ("plan_messages", "plans", "recommendations", "sender_groups", "messages", "scans"):
                 c.execute(f"DELETE FROM {t}")
-            c.execute("DELETE FROM settings WHERE key LIKE 'cleanup.%'")
+            c.execute("DELETE FROM settings WHERE key LIKE 'cleanup.%' OR key='labels.map'")

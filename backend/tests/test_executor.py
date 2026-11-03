@@ -276,7 +276,7 @@ def test_audit_log_complete_and_append_only(db, provider, scanned, executor, unl
 
 def test_batch_size_within_gmail_limit(db, provider, scanned, retry, unlocked):
     from sift.executor import Executor
-    ex = Executor(db, provider, retry=retry, chunk=5000)
+    ex = Executor(db, provider, provider, retry=retry, chunk=5000)
     assert ex.chunk <= 1000
     sizes = []
     real = provider.batch_modify

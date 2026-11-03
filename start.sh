@@ -9,6 +9,15 @@ ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
 die()  { printf "  \033[31m✗\033[0m %s\n" "$*"; exit 1; }
 
+# Optional: ./start.sh --gmail | --mock overrides SIFT_PROVIDER from .env for this launch.
+for arg in "$@"; do
+  case "$arg" in
+    --gmail) export SIFT_PROVIDER=gmail ;;
+    --mock)  export SIFT_PROVIDER=mock ;;
+    *) echo "unknown option $arg (use --gmail or --mock)"; exit 2 ;;
+  esac
+done
+
 bold "Sift: checking your setup"
 
 # --- Python 3.12+ --------------------------------------------------------------
@@ -121,7 +130,13 @@ bold "Configuration"
 STATUS_JSON="$STATUS" "$PY" - <<'EOF'
 import json, os
 s = json.loads(os.environ["STATUS_JSON"])
-mailbox = "SYNTHETIC mock mailbox (no real account)" if s["synthetic"] else s["provider_name"]
+if s["synthetic"]:
+    mailbox = "SYNTHETIC mock mailbox (no real account)"
+else:
+    conn = s["connection"]["state"]
+    mailbox = f"Gmail: {s['account']}" if conn == "connected" and s["account"] else f"Gmail: {conn.replace('_', ' ')}"
+    if s.get("client_secrets_present") is False:
+        mailbox += " (OAuth client file missing, see docs/google-setup.md)"
 cap = "unlocked" if s["full_runs_unlocked"] else "locked until a run + restore are verified"
 print(f"  Mailbox:       {mailbox}")
 print(f"  Access:        {s['mode']}")

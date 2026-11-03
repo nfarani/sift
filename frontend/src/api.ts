@@ -30,7 +30,12 @@ export const api = {
 };
 
 export interface Status {
-  account: string;
+  account: string | null;
+  provider: string;
+  connection: { state: "disconnected" | "connecting" | "connected" | "reauth_required" | "error"; error: string | null };
+  can_modify: boolean;
+  client_secrets_present: boolean | null;
+  credential_store: string | null;
   synthetic: boolean;
   provider_name: string;
   classifier: { name: string; label: string; uses_ai: boolean };
@@ -44,7 +49,7 @@ export interface Status {
 export interface CategoryRow { category: string; label: string; total: number; inbox: number; unread: number; protected: number; keep: boolean }
 
 export interface Dashboard {
-  account: string;
+  account: string | null;
   synthetic: boolean;
   scanned: number;
   sent_scanned: number;
@@ -72,6 +77,9 @@ export interface Scan {
   errors: number;
   error_log: { at: string; error: string }[];
   resumable: boolean;
+  max_per_phase: number | null;
+  rate_mps: number | null;
+  eta_s: number | null;
   started_at: string;
   finished_at: string | null;
 }

@@ -70,12 +70,22 @@ def load_context(db, user_email: str) -> ProtectionContext:
     """Build the context from scanned SENT mail and the user's rules."""
     ctx = ProtectionContext(user_email=user_email)
     with db.connect() as c:
+        # to_addrs holds every recipient of your sent mail: To, Cc and Bcc.
         for r in c.execute("SELECT thread_id, to_addrs FROM messages WHERE is_sent=1"):
             ctx.sent_threads.add(r["thread_id"])
             for a in (r["to_addrs"] or "").split(","):
                 if a.strip():
                     ctx.sent_recipients.add(a.strip().lower())
-        for r in c.execute("SELECT kind, value FROM protection_rules"):
-            {"sender": ctx.protected_senders, "domain": ctx.protected_domains,
-             "label": ctx.protected_labels}[r["kind"]].add(r["value"].lower() if r["kind"] != "label" else r["value"])
+        rules = [(r["kind"], r["value"]) for r in c.execute("SELECT kind, value FROM protection_rules")]
+    # Label rules are typed as names ("Work"); messages carry label ids ("Label_123"). Resolve both ways.
+    by_name: dict[str, set[str]] = {}
+    for lid, name in (db.get_setting("labels.map", {}) or {}).items():
+        by_name.setdefault(name.lower(), set()).add(lid)
+    for kind, value in rules:
+        if kind == "label":
+            ctx.protected_labels |= by_name.get(value.lower(), set()) | {value}
+        elif kind == "sender":
+            ctx.protected_senders.add(value.lower())
+        else:
+            ctx.protected_domains.add(value.lower())
     return ctx

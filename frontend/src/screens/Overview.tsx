@@ -1,6 +1,7 @@
 import { api, Dashboard, Scan } from "../api";
 import { usePoll } from "../hooks";
 import { n, pct } from "../format";
+import { ScanChoice } from "./ScanScreen";
 
 export default function Overview({ go }: { go: (r: string) => void }) {
   const { data: d, error } = usePoll(() => api.get<Dashboard>("/dashboard"), null);
@@ -17,12 +18,10 @@ export default function Overview({ go }: { go: (r: string) => void }) {
           Sift reads message headers only (sender, subject, labels, dates). It never opens bodies or attachments,
           never marks anything as read, and changes nothing until you approve an exact plan.
         </p>
-        {d.synthetic && (
-          <p className="muted">You're connected to a synthetic mailbox of about 45,000 fictional messages.</p>
-        )}
-        <button className="btn btn-primary btn-lg" onClick={async () => { await api.post("/scan"); go("scan"); }}>
-          Start read-only scan
-        </button>
+        {d.synthetic
+          ? <p className="muted">You're connected to a synthetic mailbox of about 45,000 fictional messages.</p>
+          : <p className="muted">Start with a test scan to check everything works on {d.account}.</p>}
+        <ScanChoice synthetic={d.synthetic} onStart={async (max) => { await api.post("/scan", { max_messages: max }); go("scan"); }} />
         {scan.status !== "none" && scan.resumable && (
           <button className="btn btn-ghost" onClick={() => go("scan")}>Resume the interrupted scan</button>
         )}

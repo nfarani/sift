@@ -57,9 +57,13 @@ class Settings:
     def allowed_origins(self) -> set[str]:
         return {f"http://{h}" for h in self.allowed_hosts}
 
+    client_secrets: Path = field(default_factory=lambda: Path(
+        os.environ.get("GOOGLE_CLIENT_SECRETS", "~/.sift/client_secret.json")).expanduser())
+
     @property
     def app_db(self) -> Path:
-        return self.data_dir / "sift.sqlite"
+        # Synthetic and real data never share a database.
+        return self.data_dir / ("sift.sqlite" if self.provider == "mock" else f"sift-{self.provider}.sqlite")
 
     @property
     def mock_db(self) -> Path:
@@ -69,6 +73,7 @@ class Settings:
         return {
             "provider": self.provider,
             "synthetic": self.provider == "mock",
+            "client_secrets_present": self.client_secrets.exists() if self.provider == "gmail" else None,
             "anthropic_api_key": "set" if self.anthropic_key_set else "not set",
             "ai_enabled": False,  # Phase 1: rules only, no AI calls are made.
             "first_run_cap": self.first_run_cap,

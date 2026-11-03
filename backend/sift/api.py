@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -18,7 +19,8 @@ from .db import Database, now_iso
 from .executor import ExecutionError, Executor, unlocked
 from .jobs import JobRunner, recover_interrupted
 from .plans import PlanError, PlanItem, approve_plan, create_plan, get_plan
-from .providers.base import MailProvider
+from .providers.base import MailReader, MailWriter, ProviderError
+from .providers.gmail_auth import AuthError, ReauthRequired, TokenStore, check_scopes, revoke, run_consent_flow
 from .providers.mock import MockProvider
 from .retry import RetryPolicy
 from .scanner import Scanner
@@ -30,11 +32,21 @@ log = logging.getLogger("sift")
 class State:
     settings: Settings
     db: Database
-    provider: MailProvider
+    provider: MailReader | None      # read access (scanner, analysis, revalidation)
+    writer: MailWriter | None        # write access: only ever passed to the Executor
     classifier: Classifier
-    scanner: Scanner
+    scanner: Scanner | None
     executor: Executor
     jobs: JobRunner
+    retry: RetryPolicy
+    token_store: TokenStore | None = None
+    reader_factory: object = None
+    connection: dict = field(default_factory=lambda: {"state": "disconnected", "error": None})
+
+    def attach(self, reader: MailReader | None, writer: MailWriter | None) -> None:
+        self.provider, self.writer = reader, writer
+        self.scanner = Scanner(self.db, reader, self.classifier, self.retry) if reader else None
+        self.executor = Executor(self.db, reader, writer, self.settings.first_run_cap, self.retry)
 
 
 class PlanItemIn(BaseModel):
@@ -57,22 +69,47 @@ class PreviewIn(BaseModel):
     excluded_senders: list[str] = []
 
 
+class ScanIn(BaseModel):
+    max_messages: int | None = Field(None, ge=1, le=1_000_000)  # test scan: cap Sent and Inbox each
+
+
 class RuleIn(BaseModel):
     kind: str
     value: str
 
 
-def build_state(settings: Settings, provider: MailProvider | None = None, retry: RetryPolicy | None = None) -> State:
+def build_state(settings: Settings, provider: MailReader | None = None, retry: RetryPolicy | None = None,
+                token_store: TokenStore | None = None, reader_factory=None) -> State:
     db = Database(settings.app_db)
-    if provider is None:
-        if settings.provider != "mock":
-            raise RuntimeError(f"provider {settings.provider!r} is not available until Phase 2")
-        provider = MockProvider(settings.mock_db, size=settings.mock_size, seed=settings.mock_seed,
-                                latency_ms=settings.mock_latency_ms)
     retry = retry or RetryPolicy(settings.max_attempts, settings.backoff_base, settings.backoff_max)
     classifier = RuleOnlyClassifier()
-    return State(settings, db, provider, classifier, Scanner(db, provider, classifier, retry),
-                 Executor(db, provider, settings.first_run_cap, retry), JobRunner(db))
+    state = State(settings, db, None, None, classifier, None, Executor(db, None, None), JobRunner(db), retry)
+    if provider is None and settings.provider == "mock":
+        provider = MockProvider(settings.mock_db, size=settings.mock_size, seed=settings.mock_seed,
+                                latency_ms=settings.mock_latency_ms)
+    if provider is not None:
+        # The mock can write to its own synthetic mailbox; a real reader never doubles as a writer.
+        state.attach(provider, provider if isinstance(provider, MockProvider) else None)
+        state.connection = {"state": "connected", "error": None}
+        return state
+    if settings.provider != "gmail":
+        raise RuntimeError(f"unknown provider {settings.provider!r}")
+    state.token_store = token_store or TokenStore()
+    state.reader_factory = reader_factory or _gmail_reader
+    creds = state.token_store.load()
+    if creds is not None:
+        try:
+            check_scopes(creds)
+            state.attach(state.reader_factory(creds, state.token_store), None)  # read-only: no writer
+            state.connection = {"state": "connected", "error": None}
+        except AuthError as e:
+            state.connection = {"state": "error", "error": str(e)}
+    return state
+
+
+def _gmail_reader(creds, store):
+    from .providers.gmail import GmailReader
+    return GmailReader(creds, store)
 
 
 def _ms_to_iso(ms):
@@ -104,17 +141,92 @@ def create_app(state: State) -> FastAPI:
     def bad(e: Exception, code: int = 400):
         raise HTTPException(code, str(e))
 
+    def need_reader() -> MailReader:
+        if state.provider is None:
+            bad("Gmail is not connected", 409)
+        return state.provider
+
+    def account() -> str | None:
+        """Connected account address. Cached locally so status checks don't spend Gmail quota."""
+        if state.provider is None:
+            return None
+        cached = db.get_setting("account.email")
+        if cached:
+            return cached
+        try:
+            email = state.provider.account_email()
+        except ReauthRequired as e:
+            state.connection = {"state": "reauth_required", "error": str(e)}
+            return None
+        except ProviderError as e:
+            state.connection = {**state.connection, "error": str(e)}
+            return None
+        db.set_setting("account.email", email)
+        return email
+
     # -- status / dashboard ---------------------------------------------------
     @app.get("/api/status")
     def status():
         s = state.settings.public_status()
-        return {**s, "account": state.provider.account_email(), "provider_name": state.provider.name,
-                "synthetic": state.provider.synthetic,
+        p = state.provider
+        synthetic = bool(p and p.synthetic)
+        if synthetic:
+            mode = "synthetic mailbox: approved plans change synthetic data only"
+        elif state.writer is None:
+            mode = "read-only (gmail.readonly): Sift cannot change your mail"
+        else:
+            mode = "cleanup enabled (gmail.modify)"
+        return {**s, "account": account(), "provider_name": p.name if p else s["provider"],
+                "synthetic": synthetic, "connection": state.connection,
+                "can_modify": state.writer is not None,
+                "credential_store": "macOS Keychain" if state.token_store else None,
                 "classifier": {"name": state.classifier.name, "label": state.classifier.label,
                                "uses_ai": state.classifier.uses_ai},
-                "mode": ("synthetic mailbox: approved plans change synthetic data only" if state.provider.synthetic
-                         else "read-only"),
-                "full_runs_unlocked": unlocked(db), "busy": state.jobs.busy()}
+                "mode": mode, "full_runs_unlocked": unlocked(db), "busy": state.jobs.busy()}
+
+    # -- Gmail connection (read-only) -----------------------------------------
+    connect_lock = threading.Lock()
+
+    @app.post("/api/gmail/connect")
+    def gmail_connect():
+        if state.token_store is None:
+            bad("not running in Gmail mode (set SIFT_PROVIDER=gmail)", 404)
+        if state.connection["state"] == "connecting":
+            return status()
+        if not state.settings.client_secrets.exists():
+            bad(f"OAuth client file not found at {state.settings.client_secrets}. See docs/google-setup.md.")
+
+        def flow():
+            try:
+                creds = run_consent_flow(state.settings.client_secrets)
+                state.token_store.save(creds)
+                state.attach(state.reader_factory(creds, state.token_store), None)  # read-only, no writer
+                db.set_setting("account.email", None)
+                state.connection = {"state": "connected", "error": None}
+                account()
+            except Exception as e:  # message only, never tokens
+                log.warning("gmail connect failed: %s", type(e).__name__)
+                state.connection = {"state": "error", "error": f"{type(e).__name__}: {e}"[:300]}
+
+        with connect_lock:
+            state.connection = {"state": "connecting", "error": None}
+            threading.Thread(target=flow, name="sift-oauth", daemon=True).start()
+        return status()
+
+    @app.post("/api/gmail/disconnect")
+    def gmail_disconnect():
+        if state.token_store is None:
+            bad("not running in Gmail mode", 404)
+        if state.jobs.busy():
+            bad("wait for the current job to finish (or cancel it) before disconnecting", 409)
+        creds = state.token_store.load()
+        revoked = revoke(creds) if creds else False
+        state.token_store.delete()
+        state.attach(None, None)
+        db.wipe_analysis()  # scanned metadata from this account; the audit log is kept
+        db.set_setting("account.email", None)
+        state.connection = {"state": "disconnected", "error": None}
+        return {"revoked_at_google": revoked, "local_token_deleted": True, "local_metadata_deleted": True}
 
     @app.get("/api/dashboard")
     def dashboard():
@@ -142,7 +254,7 @@ def create_app(state: State) -> FastAPI:
         for cat in cats:
             cat["label"] = CATEGORIES.get(cat["category"], cat["category"])
             cat["keep"] = cat["category"] in KEEP
-        return {"account": state.provider.account_email(), "synthetic": state.provider.synthetic,
+        return {"account": account(), "synthetic": bool(state.provider and state.provider.synthetic),
                 "scanned": total, "sent_scanned": sent, "inbox": inbox, "unread": unread, "promotional": promos,
                 "subscriptions": subs, "protected": protected, "recommended": recommended,
                 "impact_pct": round(100 * recommended / inbox, 1) if inbox else 0,
@@ -165,7 +277,8 @@ def create_app(state: State) -> FastAPI:
         def f(msg):
             with db.connect() as c:
                 c.execute("UPDATE scans SET status='failed', updated_at=? WHERE id=?", (now_iso(), scan_id))
-            state.scanner._error(scan_id, msg)
+            if state.scanner:
+                state.scanner._error(scan_id, msg)
         return f
 
     @app.get("/api/scan")
@@ -173,15 +286,17 @@ def create_app(state: State) -> FastAPI:
         return _scan_row() or {"status": "none"}
 
     @app.post("/api/scan")
-    def scan_start():
+    def scan_start(body: ScanIn | None = None):
+        need_reader()
         if state.jobs.busy():
             bad("another job is running", 409)
-        sid = state.scanner.start()
+        sid = state.scanner.start(max_per_phase=body.max_messages if body else None)
         state.jobs.submit("scan", lambda: state.scanner.run(sid), _scan_crash(sid))
         return _scan_row(sid)
 
     @app.post("/api/scan/resume")
     def scan_resume():
+        need_reader()
         if state.jobs.busy():
             bad("another job is running", 409)
         r = state.scanner.resumable()
@@ -196,6 +311,7 @@ def create_app(state: State) -> FastAPI:
         r = _scan_row()
         if not r or r["status"] != "running":
             bad("no scan is running")
+        need_reader()
         state.scanner.request_cancel(r["id"])
         return _scan_row(r["id"])
 
@@ -259,7 +375,7 @@ def create_app(state: State) -> FastAPI:
 
     # -- protection rules -----------------------------------------------------
     def _reanalyse():
-        user = state.provider.account_email()
+        user = need_reader().account_email()
         apply_protection(db, user)
         groups = aggregate(db, user)
         classify(db, state.classifier, groups)

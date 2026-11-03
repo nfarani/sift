@@ -1,8 +1,9 @@
-"""Mail provider interface. Gmail (Phase 2) and Outlook (later) slot in behind this.
+"""Mail provider interfaces. Gmail and the mock slot in behind these; Outlook could later.
 
-Read methods are used by the scanner and by executor revalidation. Write methods
-(`ensure_label`, `batch_modify`, `trash`, `untrash`) must only ever be called from
-`sift.executor`. There is deliberately no delete, send or draft method.
+Reading and writing are separate interfaces so that write access can be held by exactly one
+module. `MailReader` is what the scanner, analysis and API get. `MailWriter` (write methods)
+is only ever handed to `sift.executor.Executor`, and for Gmail it only exists once the user has
+explicitly enabled cleanup (modify scope). There is deliberately no delete, send or draft method.
 """
 from __future__ import annotations
 
@@ -53,10 +54,9 @@ class Page:
     result_size_estimate: int | None = None
 
 
-class MailProvider(ABC):
+class MailReader(ABC):
     name: str = "base"
     synthetic: bool = False
-    max_modify_batch: int = 1000  # Gmail batchModify limit
 
     @abstractmethod
     def account_email(self) -> str: ...
@@ -81,7 +81,15 @@ class MailProvider(ABC):
         """Of the given threads, those that currently contain a message you sent
         (Gmail: threads.get format=minimal, look for the SENT label). Read-only."""
 
-    # --- write methods: executor only ------------------------------------
+    def label_names(self) -> dict[str, str]:
+        """{label_id: label_name} for user and system labels. Used to resolve label protection rules."""
+        return {}
+
+
+class MailWriter(ABC):
+    """Write access. Only the Executor may hold one."""
+    max_modify_batch: int = 1000  # Gmail batchModify limit
+
     @abstractmethod
     def ensure_label(self, name: str) -> str:
         """Create the label if missing; return its id."""
@@ -94,3 +102,8 @@ class MailProvider(ABC):
 
     @abstractmethod
     def untrash(self, message_id: str) -> None: ...
+
+
+# Back-compat alias: a provider that can both read and write (the mock).
+class MailProvider(MailReader, MailWriter, ABC):
+    pass

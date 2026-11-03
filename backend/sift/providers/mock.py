@@ -133,6 +133,11 @@ class MockProvider(MailProvider):
                 list_unsubscribe=r["list_unsubscribe"], list_unsubscribe_post=r["list_unsubscribe_post"]))
         return out
 
+    def label_names(self) -> dict[str, str]:
+        with self._conn() as c:
+            users = {r[0]: r[1] for r in c.execute("SELECT id, name FROM user_labels")}
+        return {**{l: l for l in SYSTEM_LABELS}, **users}
+
     def threads_with_sent(self, thread_ids: list[str]) -> set[str]:
         self._enter("threads")
         if not thread_ids:

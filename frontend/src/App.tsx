@@ -8,6 +8,8 @@ import Recommendations from "./screens/Recommendations";
 import Confirm from "./screens/Confirm";
 import RunScreen from "./screens/RunScreen";
 import History from "./screens/History";
+import Account from "./screens/Account";
+import Connect from "./screens/Connect";
 
 const NAV: [string, string][] = [
   ["overview", "Overview"],
@@ -15,11 +17,12 @@ const NAV: [string, string][] = [
   ["recommendations", "Recommendations"],
   ["confirm", "Confirm"],
   ["history", "Runs"],
+  ["account", "Account"],
 ];
 
 export default function App() {
   const [route, go] = useHashRoute();
-  const { data: status, reload: reloadStatus } = usePoll(() => api.get<Status>("/status"), 4000);
+  const { data: status, reload: reloadStatus } = usePoll(() => api.get<Status>("/status"), 2500);
   const [selection, setSelection] = useState<Selection>(loadSelection);
   useEffect(() => saveSelection(selection), [selection]);
 
@@ -43,22 +46,28 @@ export default function App() {
         </nav>
         <div className="status-chips">
           {status?.synthetic && <span className="chip chip-synthetic" title="Synthetic mailbox for development. Nothing here is real mail.">Synthetic data</span>}
+          {status && !status.synthetic && status.connection.state === "connected" && (
+            <span className="chip chip-live" title={status.mode}>Gmail · {status.can_modify ? "cleanup enabled" : "read-only"}</span>
+          )}
           {status && (
             <span className={`chip ${status.classifier.uses_ai ? "chip-ai" : "chip-rules"}`}
               title={status.classifier.uses_ai ? "Claude classifies ambiguous senders" : "No AI calls are made. Deterministic rules only."}>
               {status.classifier.label}
             </span>
           )}
-          {status && <span className="account">{status.account}</span>}
+          {status?.account && <span className="account">{status.account}</span>}
         </div>
       </header>
       <main>
+        {status && status.connection.state !== "connected" && page !== "account" ? <Connect status={status} onChange={reloadStatus} /> : <>
         {page === "overview" && <Overview go={go} />}
-        {page === "scan" && <ScanScreen go={go} />}
+        {page === "scan" && <ScanScreen go={go} synthetic={!!status?.synthetic} />}
         {page === "recommendations" && <Recommendations selection={selection} setSelection={setSelection} go={go} />}
         {page === "confirm" && <Confirm selection={selection} status={status} go={go} />}
         {page === "run" && arg && <RunScreen runId={Number(arg)} go={go} onChange={reloadStatus} status={status} />}
         {page === "history" && <History go={go} />}
+        {page === "account" && <Account status={status} onChange={reloadStatus} />}
+        </>}
       </main>
       <footer className="foot">
         {status?.synthetic

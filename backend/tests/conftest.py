@@ -48,7 +48,7 @@ def scanned(scanner):
 
 @pytest.fixture
 def executor(db, provider, retry):
-    return Executor(db, provider, first_run_cap=50, retry=retry, chunk=100)
+    return Executor(db, provider, provider, first_run_cap=50, retry=retry, chunk=100)
 
 
 @pytest.fixture
