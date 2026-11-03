@@ -2,7 +2,7 @@
 
 ## Current phase
 Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
-1. Safety review of the Phase 2 changes (scopes, tokens, reader/writer split). Not run yet; must happen before connecting a real account.
+1. Safety review of Phase 2: first pass BLOCKING (quota limiter hang, OAuth code in log); fixed with tests (110 pass); re-check running.
 2. Nick: Google Cloud setup per docs/google-setup.md.
 3. Then: 500-message test scan, full read-only scan with timing and error counts, /gate.
 
@@ -53,6 +53,11 @@ Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
 4. The first-run cap applies per run; repeated capped runs need no unlock. Decide: one capped run until unlock.
 5. The idempotency shortcut (own run label already applied) writes no audit row and doesn't flag a now-protected message.
 6. DB hardening: block cancelled/completed → approved, and DELETE on `plan_messages` once a plan leaves draft.
+7. (Phase 2 review P4-b) Plans approved while read-only stay approved; require approval after cleanup is enabled.
+8. (P4-c) Once gmail.modify is granted, the reader's token can modify too. Use a separate writer token, or record this as an accepted deviation; re-check scopes after refresh.
+9. (P4-d) Label rules resolve through labels.map from the last scan (can be stale); nested labels ("Work/Clients") aren't matched by "Work".
+10. (P4-e) Check that disconnect can't fail midway once runs exist (it currently wipes plans).
+Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_test_scan_cannot_drive_cleanup`).
 
 **Other**
 - Demo mode (PII masking) not built (Phase 5).

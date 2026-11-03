@@ -189,6 +189,8 @@ class Scanner:
         except ProviderError as e:
             self._error(scan_id, f"gave up: {e}")
             self._update(scan_id, status="failed", elapsed_s=elapsed())
+            if getattr(e, "reauth", False):
+                raise  # let the app flip the connection to "reconnect needed"
             return "failed"
         except Exception as e:  # unexpected: record it, keep the checkpoint so resume is possible
             self._error(scan_id, f"internal error: {type(e).__name__}: {e}")

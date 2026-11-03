@@ -58,7 +58,10 @@ class Executor:
                 raise ExecutionError("plan contents changed after approval; refusing to run")
             if c.execute("SELECT 1 FROM runs WHERE status='running'").fetchone():
                 raise ExecutionError("another run is in progress")
-            last = c.execute("SELECT status FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+            last = c.execute("SELECT status, max_per_phase FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+            if last is not None and last["max_per_phase"] is not None:
+                # A test scan only saw part of your Sent mail, so "people you've emailed" is incomplete.
+                raise ExecutionError("the latest scan was a capped test scan; run a full scan before cleaning up")
             if last is None or last["status"] != "completed":
                 # protection context (your sent mail, rules) comes from the last scan; it must be complete
                 raise ExecutionError("the latest scan is not complete; finish or resume it before running a plan")

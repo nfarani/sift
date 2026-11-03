@@ -36,6 +36,7 @@ class AuthError(Exception):
 
 class ReauthRequired(AuthError, PermanentError):
     """Refresh token expired or revoked (Testing-mode refresh tokens last 7 days)."""
+    reauth = True
 
 
 class TokenStore:
@@ -91,8 +92,17 @@ def run_consent_flow(client_secrets: Path, timeout_s: int = 300) -> Credentials:
     creds = flow.run_local_server(host="127.0.0.1", port=0, open_browser=True, timeout_seconds=timeout_s,
                                   authorization_prompt_message="Opening Google sign-in in your browser…",
                                   success_message="Sift is connected (read-only). You can close this tab.")
-    check_scopes(creds)
+    try:
+        check_scopes(creds)
+    except AuthError:
+        revoke(creds)  # don't leave a grant we refuse to use live at Google
+        raise
     return creds
+
+
+def credential_store_name() -> str:
+    kr = keyring.get_keyring()
+    return "macOS Keychain" if "macOS" in type(kr).__module__ else type(kr).__name__
 
 
 def revoke(creds: Credentials, opener=urllib.request.urlopen) -> bool:

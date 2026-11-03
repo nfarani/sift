@@ -368,3 +368,13 @@ def test_label_creation_is_audited(db, provider, scanned, executor, unlocked):
     with db.connect() as c:
         row = c.execute("SELECT detail FROM audit_log WHERE run_id=? AND action='ensure_label'", (rid,)).fetchone()
     assert row and row[0].startswith("Sift/")
+
+
+
+def test_capped_test_scan_cannot_drive_cleanup(db, provider, scanner, executor, unlocked):
+    """Review P4-a: a test scan saw only part of your Sent mail, so it can't back a cleanup run."""
+    sid = scanner.start(max_per_phase=100)
+    assert scanner.run(sid) == "completed"
+    p = approved_plan(db)
+    with pytest.raises(ExecutionError, match="test scan"):
+        executor.create_run(p["id"])

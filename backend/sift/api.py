@@ -20,7 +20,8 @@ from .executor import ExecutionError, Executor, unlocked
 from .jobs import JobRunner, recover_interrupted
 from .plans import PlanError, PlanItem, approve_plan, create_plan, get_plan
 from .providers.base import MailReader, MailWriter, ProviderError
-from .providers.gmail_auth import AuthError, ReauthRequired, TokenStore, check_scopes, revoke, run_consent_flow
+from .providers.gmail_auth import (AuthError, ReauthRequired, TokenStore, check_scopes, credential_store_name,
+                                   revoke, run_consent_flow)
 from .providers.mock import MockProvider
 from .retry import RetryPolicy
 from .scanner import Scanner
@@ -179,7 +180,7 @@ def create_app(state: State) -> FastAPI:
         return {**s, "account": account(), "provider_name": p.name if p else s["provider"],
                 "synthetic": synthetic, "connection": state.connection,
                 "can_modify": state.writer is not None,
-                "credential_store": "macOS Keychain" if state.token_store else None,
+                "credential_store": credential_store_name() if state.token_store else None,
                 "classifier": {"name": state.classifier.name, "label": state.classifier.label,
                                "uses_ai": state.classifier.uses_ai},
                 "mode": mode, "full_runs_unlocked": unlocked(db), "busy": state.jobs.busy()}
@@ -191,24 +192,33 @@ def create_app(state: State) -> FastAPI:
     def gmail_connect():
         if state.token_store is None:
             bad("not running in Gmail mode (set SIFT_PROVIDER=gmail)", 404)
-        if state.connection["state"] == "connecting":
-            return status()
         if not state.settings.client_secrets.exists():
             bad(f"OAuth client file not found at {state.settings.client_secrets}. See docs/google-setup.md.")
+        if state.jobs.busy():
+            bad("wait for the current job to finish before reconnecting", 409)
 
         def flow():
             try:
                 creds = run_consent_flow(state.settings.client_secrets)
+                old = state.token_store.load()
+                previous = db.get_setting("account.email")
+                reader = state.reader_factory(creds, state.token_store)
+                new_email = reader.account_email()
+                if previous and previous != new_email:
+                    db.wipe_analysis()  # never show one account's data under another
                 state.token_store.save(creds)
-                state.attach(state.reader_factory(creds, state.token_store), None)  # read-only, no writer
-                db.set_setting("account.email", None)
+                if old is not None and old.refresh_token != creds.refresh_token:
+                    revoke(old)  # replaced grants don't linger at Google
+                state.attach(reader, None)  # read-only, no writer
+                db.set_setting("account.email", new_email)
                 state.connection = {"state": "connected", "error": None}
-                account()
             except Exception as e:  # message only, never tokens
                 log.warning("gmail connect failed: %s", type(e).__name__)
                 state.connection = {"state": "error", "error": f"{type(e).__name__}: {e}"[:300]}
 
         with connect_lock:
+            if state.connection["state"] == "connecting":
+                return status()
             state.connection = {"state": "connecting", "error": None}
             threading.Thread(target=flow, name="sift-oauth", daemon=True).start()
         return status()
@@ -279,6 +289,8 @@ def create_app(state: State) -> FastAPI:
                 c.execute("UPDATE scans SET status='failed', updated_at=? WHERE id=?", (now_iso(), scan_id))
             if state.scanner:
                 state.scanner._error(scan_id, msg)
+            if "ReauthRequired" in msg:
+                state.connection = {"state": "reauth_required", "error": "Google sign-in expired; reconnect Gmail"}
         return f
 
     @app.get("/api/scan")
@@ -522,6 +534,13 @@ def create_app(state: State) -> FastAPI:
     return app
 
 
-def default_app() -> FastAPI:
+def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # The OAuth redirect handler logs the full request line, which contains the one-time authorization code.
+    for noisy in ("google_auth_oauthlib", "googleapiclient", "google.auth", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def default_app() -> FastAPI:
+    configure_logging()
     return create_app(build_state(Settings()))

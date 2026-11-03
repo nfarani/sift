@@ -37,7 +37,7 @@ export default function Account({ status, onChange }: { status: Status | null; o
         {status.connection.error && <div className="notice notice-error">{status.connection.error}</div>}
       </section>
 
-      {status.provider === "gmail" && connected && (
+      {status.provider === "gmail" && status.connection.state !== "disconnected" && status.connection.state !== "connecting" && (
         <section className="card">
           <h2>Disconnect Gmail</h2>
           <p className="muted">

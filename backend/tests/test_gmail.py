@@ -290,7 +290,9 @@ def gmail_app(tmp_path, monkeypatch, retry):
     store = TokenStore(kr)
     kr.set_password("sift-gmail", "oauth-token", FakeCreds().to_json())
     monkeypatch.setattr(TokenStore, "load", lambda self: FakeCreds() if self.backend.store else None)
-    msgs = {f"i{i:04}": msg(f"i{i:04}", thread=f"t{i}") for i in range(700)}
+    msgs = {f"i{i:04}": msg(f"i{i:04}", thread=f"t{i}", subject="50% off everything",
+                            labels=("INBOX", "UNREAD", "CATEGORY_PROMOTIONS"),
+                            extra=[("List-Id", "<deals.shop.example>")]) for i in range(700)}
     msgs.update({f"s{i:04}": msg(f"s{i:04}", frm="Me <me@example.com>", labels=("SENT",), to="pal@example.com",
                                  thread=f"t{i}") for i in range(20)})
     g = G(msgs)
@@ -320,13 +322,14 @@ def test_gmail_mode_is_read_only(gmail_app):
     assert FAKE_TOKEN not in json.dumps(st) and FAKE_REFRESH not in json.dumps(st)
     c.post("/api/scan", json={"max_messages": 500})
     assert wait_scan(c)["status"] == "completed"
-    plan = c.post("/api/plans", json={"items": [{"rec_id": r["id"]} for r in c.get("/api/recommendations").json()["items"]
-                                                if r["action"] != "review"][:1]})
-    if plan.status_code == 200:
-        p = plan.json()
-        c.post(f"/api/plans/{p['id']}/approve", json={"confirm_hash": p["ids_hash"]})
-        r = c.post(f"/api/plans/{p['id']}/execute")
-        assert r.status_code == 400 and "read-only" in r.json()["detail"]
+    recs = [r for r in c.get("/api/recommendations").json()["items"] if r["action"] != "review" and r["count"]]
+    assert recs, "fixture should yield at least one actionable recommendation"
+    plan = c.post("/api/plans", json={"items": [{"rec_id": recs[0]["id"]}]})
+    assert plan.status_code == 200
+    p = plan.json()
+    c.post(f"/api/plans/{p['id']}/approve", json={"confirm_hash": p["ids_hash"]})
+    r = c.post(f"/api/plans/{p['id']}/execute")
+    assert r.status_code == 400 and "read-only" in r.json()["detail"]
 
 
 def test_capped_scan_reads_at_most_500_per_phase(gmail_app):
@@ -390,3 +393,73 @@ def test_scan_reports_throughput_and_eta(db, provider, scanner):
     with db.connect() as c:
         r = c.execute("SELECT rate_mps, eta_s FROM scans WHERE id=?", (sid,)).fetchone()
     assert r["rate_mps"] and r["rate_mps"] > 0
+
+
+
+def test_default_limiter_admits_full_batches():
+    """Review B1: a 50-message batch (1,000 units) must get through the default 5,400/min bucket."""
+    t = [0.0]
+
+    def sleep(x):
+        t[0] += x
+
+    q = QuotaLimiter(clock=lambda: t[0], sleep=sleep)  # production default
+    for _ in range(10):
+        q.acquire(20 * 50)
+    assert t[0] < 120  # 10,000 units at 90 units/s, minus burst ≈ 101 s; crucially, it returns
+    q.acquire(40 * 50)  # a threads.get batch (2,000 units) too
+
+
+def test_production_reader_uses_default_limiter_end_to_end():
+    g = G({f"m{i:03}": msg(f"m{i:03}") for i in range(50)})
+    r = GmailReader(FakeCreds(), TokenStore(FakeKeyring()), service_factory=lambda c: g)
+    t0 = time.monotonic()
+    assert len(r.get_metadata(sorted(g.msgs))) == 50
+    assert time.monotonic() - t0 < 5
+
+
+def test_oauth_library_logs_silenced():
+    """Review B2: the redirect handler's request line (with the auth code) must not reach the log."""
+    from sift.api import configure_logging
+    configure_logging()
+    lg = logging.getLogger("google_auth_oauthlib.flow")
+    assert not lg.isEnabledFor(logging.INFO)
+
+
+def test_refused_token_is_revoked(monkeypatch, tmp_path):
+    bad = FakeCreds()
+    bad.granted_scopes = [READONLY_SCOPE, "https://www.googleapis.com/auth/gmail.modify"]
+
+    class Flow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes):
+            return cls()
+
+        def run_local_server(self, **kw):
+            return bad
+
+    revoked = []
+    monkeypatch.setattr(gmail_auth, "InstalledAppFlow", Flow)
+    monkeypatch.setattr(gmail_auth, "revoke", lambda c: revoked.append(c) or True)
+    secrets = tmp_path / "cs.json"
+    secrets.write_text("{}")
+    with pytest.raises(AuthError):
+        gmail_auth.run_consent_flow(secrets)
+    assert revoked == [bad]
+
+
+def test_expired_signin_flips_to_reconnect(gmail_app):
+    c, state, g, _, _ = gmail_app
+    from sift.providers.gmail_auth import ReauthRequired
+
+    def expired(*a, **k):
+        raise ReauthRequired("Google sign-in expired; reconnect Gmail")
+
+    state.provider.count_label = expired
+    c.post("/api/scan", json={"max_messages": 10})
+    assert wait_scan(c)["status"] == "failed"
+    for _ in range(100):  # the job thread flips the state right after recording the failure
+        if c.get("/api/status").json()["connection"]["state"] == "reauth_required":
+            return
+        time.sleep(0.02)
+    raise AssertionError("connection never flipped to reauth_required")

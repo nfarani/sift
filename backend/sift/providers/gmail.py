@@ -45,15 +45,23 @@ class QuotaLimiter:
         self.lock = threading.Lock()
 
     def acquire(self, units: float) -> None:
+        # A request larger than the bucket (e.g. a 50 x 20-unit batch) is paid for in bucket-sized parts,
+        # otherwise it could never be admitted.
+        while units > self.capacity:
+            self._take(self.capacity)
+            units -= self.capacity
+        self._take(units)
+
+    def _take(self, units: float) -> None:
         with self.lock:
             while True:
                 now = self.clock()
                 self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
                 self.last = now
-                if self.tokens >= units:
-                    self.tokens -= units
+                if self.tokens >= units - 1e-6:  # tolerance: float rounding must not stall the loop
+                    self.tokens = max(0.0, self.tokens - units)
                     return
-                self.sleep((units - self.tokens) / self.rate)
+                self.sleep(max(0.01, (units - self.tokens) / self.rate))
 
 
 def _classify(e: Exception) -> Exception:
