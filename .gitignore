@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+secrets/
+*client_secret*.json
+*token*.json
+credentials.json
+*.sqlite
+*.sqlite3
+*.db
+__pycache__/
+.venv/
+venv/
+node_modules/
+dist/
+.DS_Store
+.claude/settings.local.json
