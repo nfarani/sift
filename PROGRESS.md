@@ -1,13 +1,16 @@
 # PROGRESS
 
 ## Current phase
-Phase 1 gate **PASSED** on 2026-11-03. Next: `/phase-2` (waits for Nick).
+Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
+1. Safety review of the Phase 2 changes (scopes, tokens, reader/writer split). Not run yet; must happen before connecting a real account.
+2. Nick: Google Cloud setup per docs/google-setup.md.
+3. Then: 500-message test scan, full read-only scan with timing and error counts, /gate.
 
 ## Phase status
 | Phase | Status | Gate |
 |---|---|---|
 | 1. Mock end-to-end | done | PASSED 2026-11-03 (83/83 tests, safety re-audit: SAFE TO PROCEED) |
-| 2. Read-only Gmail | not started | — |
+| 2. Read-only Gmail | in progress | — |
 | 3. Claude classification + NL | not started | — |
 | 4. First real modifications | not started | — |
 | 5. Full run, polish, demo | not started | — |
@@ -36,9 +39,9 @@ Phase 1 gate **PASSED** on 2026-11-03. Next: `/phase-2` (waits for Nick).
 - `/phase-2`: GmailProvider (read-only). Must do first: S1, S6 below.
 
 ## Known issues
-**Must fix before Phase 2**
-- S1: scanner and executor share one provider instance. Split read and write providers so only the Executor holds a modify-scope credential.
-- S6: user label rules compare names to label IDs (Gmail needs a name→ID mapping). "Sender you've emailed" must include Cc/Bcc.
+**Fixed in Phase 2 (2a8a70d, not yet safety-reviewed)**
+- S1: MailReader and MailWriter are now split; in Gmail mode no writer exists at all.
+- S6: label rules now resolve names to label IDs; Cc/Bcc recipients now count as people you've emailed.
 
 **Must fix before Phase 3**
 - S7: classifier output is coerced to `uncertain` on unknown categories. It needs strict schema validation that rejects, plus confidence bounds.
