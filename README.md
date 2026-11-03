@@ -14,6 +14,33 @@ unzip sift-agent.zip && cd sift-agent
 ```
 Or do it manually: `git init`, then run `claude` and type `/phase-1`.
 
+## Running the app
+```bash
+./start.sh            # checks deps + .env, starts API (127.0.0.1:8765) and UI (127.0.0.1:5173), opens the browser
+```
+`SIFT_NO_OPEN=1 ./start.sh` skips opening the browser. Logs are in `data/logs/`. Ctrl-C stops both servers.
+
+Until Phase 2 the app runs against a **synthetic mailbox** of ~45,000 fictional messages (`data/mock_mailbox.sqlite`),
+badged "Synthetic data" everywhere. Classification is **rules only, no AI** until Phase 3.
+
+Tests: `cd backend && .venv/bin/python -m pytest` · frontend typecheck: `cd frontend && npm run typecheck`.
+
+### Layout
+```
+backend/sift/
+  providers/base.py     MailProvider interface (read methods + executor-only write methods; no delete/send)
+  providers/mock.py     MockProvider (SQLite-backed, Gmail-shaped, fault injection)
+  providers/synthetic.py  deterministic 45k fictional mailbox incl. prompt-injection subjects
+  scanner.py            metadata-only paginated scan, checkpoints, cancel/resume
+  protection.py         deterministic protection rules (run before any classifier)
+  analysis.py           aggregation → protection → classification → recommendations
+  classifier/           Classifier interface + RuleOnlyClassifier
+  plans.py              frozen plans (exact ids + hash, DB triggers block changes)
+  executor.py           the only module that modifies mail: revalidate, batch, confirm, audit, restore
+  api.py                FastAPI routes the UI reads from
+frontend/src/           React + TS + Vite UI
+```
+
 ## Commands, from inside Claude Code
 | Command | What it does |
 |---|---|

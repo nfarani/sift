@@ -93,6 +93,12 @@ class MockProvider(MailProvider):
             t = c.execute("SELECT COUNT(DISTINCT thread_id) FROM mbox").fetchone()[0]
         return {"email": USER_EMAIL, "messages_total": n, "threads_total": t}
 
+    def count_label(self, label: str) -> int:
+        self._enter("labels")
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) FROM mbox WHERE labels LIKE ? AND labels NOT LIKE '%\"TRASH\"%'",
+                             (f'%"{label}"%',)).fetchone()[0]
+
     def list_message_ids(self, label: str, page_token: str | None = None, max_results: int = 500) -> Page:
         self._enter("list")
         offset = int(page_token) if page_token else 0

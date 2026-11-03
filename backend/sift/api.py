@@ -104,10 +104,11 @@ def create_app(state: State) -> FastAPI:
             one = lambda q, *a: c.execute(q, a).fetchone()[0]
             total = one("SELECT COUNT(*) FROM messages WHERE is_sent=0")
             inbox = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1")
-            unread = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND is_unread=1")
-            promos = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND labels LIKE '%CATEGORY_PROMOTIONS%'")
+            unread = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1 AND is_unread=1")
+            promos = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1 "
+                         "AND labels LIKE '%CATEGORY_PROMOTIONS%'")
             subs = one("SELECT COUNT(*) FROM sender_groups WHERE list_id IS NOT NULL OR has_unsub=1")
-            protected = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND protected=1")
+            protected = one("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1 AND protected=1")
             sent = one("SELECT COUNT(*) FROM messages WHERE is_sent=1")
             cats = [dict(r) for r in c.execute(
                 "SELECT category, COUNT(*) total, SUM(in_inbox) inbox, SUM(is_unread) unread, SUM(protected) protected "

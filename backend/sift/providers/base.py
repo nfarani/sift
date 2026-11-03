@@ -66,6 +66,10 @@ class MailProvider(ABC):
         """{'email', 'messages_total', 'threads_total'}"""
 
     @abstractmethod
+    def count_label(self, label: str) -> int:
+        """Total messages carrying a label (Gmail: labels.get -> messagesTotal)."""
+
+    @abstractmethod
     def list_message_ids(self, label: str, page_token: str | None = None, max_results: int = 500) -> Page: ...
 
     @abstractmethod

@@ -119,7 +119,8 @@ class Scanner:
         try:
             if cp.get("phase") in PHASES:
                 if cp["phase"] == "sent" and cp.get("page_token") is None:
-                    est = self.provider.profile().get("messages_total")
+                    est = sum(self.retry.call(lambda l=l: self.provider.count_label(l), note_retry)
+                              for l in LABEL_FOR.values())
                     self._update(scan_id, total_estimate=est)
                 for phase in PHASES[PHASES.index(cp["phase"]):]:
                     token = cp.get("page_token") if phase == cp["phase"] else None

@@ -54,3 +54,9 @@ def test_generator_is_deterministic(tmp_path):
 def test_full_size_mailbox_is_about_45k(tmp_path):
     p = MockProvider(tmp_path / "big.sqlite", size=45_000, seed=1234)
     assert 43_000 <= p.profile()["messages_total"] <= 47_000
+
+
+def test_scan_estimate_matches_what_is_scanned(db, scanned):
+    with db.connect() as c:
+        r = c.execute("SELECT total_estimate, messages_scanned FROM scans WHERE id=?", (scanned,)).fetchone()
+    assert r["total_estimate"] == r["messages_scanned"]
