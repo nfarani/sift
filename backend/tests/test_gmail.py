@@ -463,3 +463,31 @@ def test_expired_signin_flips_to_reconnect(gmail_app):
             return
         time.sleep(0.02)
     raise AssertionError("connection never flipped to reauth_required")
+
+
+def test_refresh_error_mid_request_means_reconnect():
+    from google.auth.exceptions import RefreshError
+    from sift.providers.gmail import _classify
+    from sift.providers.gmail_auth import ReauthRequired
+    assert isinstance(_classify(RefreshError("invalid_grant")), ReauthRequired)
+
+
+def test_limiter_never_exceeds_gmail_minute_quota():
+    t = [0.0]
+
+    def sleep(x):
+        t[0] += x
+
+    q = QuotaLimiter(clock=lambda: t[0], sleep=sleep)
+    spent = []
+    while t[0] < 60:
+        q.acquire(20)
+        spent.append((t[0], 20))
+    in_first_minute = sum(u for ts, u in spent if ts <= 60)
+    assert in_first_minute <= 6000
+
+
+def test_no_scan_while_connecting(gmail_app):
+    c, state, *_ = gmail_app
+    state.connection = {"state": "connecting", "error": None}
+    assert c.post("/api/scan").status_code == 409

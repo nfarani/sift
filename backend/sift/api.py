@@ -204,11 +204,15 @@ def create_app(state: State) -> FastAPI:
                 previous = db.get_setting("account.email")
                 reader = state.reader_factory(creds, state.token_store)
                 new_email = reader.account_email()
-                if previous and previous != new_email:
+                switched = bool(previous and previous != new_email)
+                if switched:
+                    if state.jobs.busy():
+                        raise AuthError("a scan is running for the previous account; cancel it and reconnect")
                     db.wipe_analysis()  # never show one account's data under another
                 state.token_store.save(creds)
-                if old is not None and old.refresh_token != creds.refresh_token:
-                    revoke(old)  # replaced grants don't linger at Google
+                if switched and old is not None:
+                    # Only for a different account: revoking the same account's grant would kill the new token.
+                    revoke(old)
                 state.attach(reader, None)  # read-only, no writer
                 db.set_setting("account.email", new_email)
                 state.connection = {"state": "connected", "error": None}
@@ -300,6 +304,8 @@ def create_app(state: State) -> FastAPI:
     @app.post("/api/scan")
     def scan_start(body: ScanIn | None = None):
         need_reader()
+        if state.connection["state"] == "connecting":
+            bad("finish connecting Gmail first", 409)
         if state.jobs.busy():
             bad("another job is running", 409)
         sid = state.scanner.start(max_per_phase=body.max_messages if body else None)
@@ -309,6 +315,8 @@ def create_app(state: State) -> FastAPI:
     @app.post("/api/scan/resume")
     def scan_resume():
         need_reader()
+        if state.connection["state"] == "connecting":
+            bad("finish connecting Gmail first", 409)
         if state.jobs.busy():
             bad("another job is running", 409)
         r = state.scanner.resumable()

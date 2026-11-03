@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Callable
 
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -38,7 +39,8 @@ class QuotaLimiter:
     def __init__(self, units_per_minute: float = 5400, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
         self.rate = units_per_minute / 60.0
-        self.capacity = units_per_minute / 6  # allow ~10s of burst
+        # Burst allowance kept small so burst + one minute of refill stays under Gmail's 6,000/min.
+        self.capacity = min(600.0, units_per_minute / 9)
         self.tokens = self.capacity
         self.clock, self.sleep = clock, sleep
         self.last = clock()
@@ -66,6 +68,8 @@ class QuotaLimiter:
 
 def _classify(e: Exception) -> Exception:
     """Map client errors onto the provider error types the retry policy understands."""
+    if isinstance(e, RefreshError):  # grant revoked/expired mid-request
+        return ReauthRequired("Google sign-in expired; reconnect Gmail")
     if isinstance(e, HttpError):
         status = e.status_code
         reason = ""

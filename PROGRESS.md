@@ -2,7 +2,7 @@
 
 ## Current phase
 Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
-1. Safety review of Phase 2: first pass BLOCKING (quota limiter hang, OAuth code in log); fixed with tests (110 pass); re-check running.
+1. Safety review of Phase 2: first pass BLOCKING (quota limiter hang, OAuth code in log), fixed. Re-check: SAFE TO CONNECT (read-only); its 4 follow-ups fixed too (113 pass).
 2. Nick: Google Cloud setup per docs/google-setup.md.
 3. Then: 500-message test scan, full read-only scan with timing and error counts, /gate.
 
