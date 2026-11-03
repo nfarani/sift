@@ -133,6 +133,16 @@ class MockProvider(MailProvider):
                 list_unsubscribe=r["list_unsubscribe"], list_unsubscribe_post=r["list_unsubscribe_post"]))
         return out
 
+    def threads_with_sent(self, thread_ids: list[str]) -> set[str]:
+        self._enter("threads")
+        if not thread_ids:
+            return set()
+        q = ",".join("?" * len(thread_ids))
+        with self._conn() as c:
+            return {r[0] for r in c.execute(
+                f"SELECT DISTINCT thread_id FROM mbox WHERE thread_id IN ({q}) AND labels LIKE '%\"SENT\"%'",
+                list(thread_ids))}
+
     # -- write (executor only) ------------------------------------------------
     def ensure_label(self, name: str) -> str:
         self._enter("labels")

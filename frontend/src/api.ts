@@ -8,7 +8,8 @@ export class ApiError extends Error {
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(`/api${path}`, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    // X-Sift marks the request as coming from this UI; the backend rejects state changes without it.
+    headers: { "X-Sift": "1", ...(body ? { "Content-Type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!r.ok) {

@@ -39,12 +39,23 @@ class Settings:
     first_run_cap: int = field(default_factory=lambda: _int("SIFT_FIRST_RUN_CAP", 50))
     demo_mode: bool = field(default_factory=lambda: _bool("SIFT_DEMO_MODE", False))
     api_port: int = field(default_factory=lambda: _int("SIFT_API_PORT", 8765))
+    # Hosts allowed to talk to the API (DNS-rebinding guard). Ports are added from api_port/ui_port.
+    extra_allowed_hosts: tuple[str, ...] = ()
     ui_port: int = field(default_factory=lambda: _int("SIFT_UI_PORT", 5173))
     anthropic_key_set: bool = field(default_factory=lambda: bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()))
     # Backoff: base delay in seconds, doubled each attempt, capped.
     backoff_base: float = 0.5
     backoff_max: float = 30.0
     max_attempts: int = 6
+
+    @property
+    def allowed_hosts(self) -> set[str]:
+        hosts = {f"{h}:{p}" for h in ("127.0.0.1", "localhost") for p in (self.api_port, self.ui_port)}
+        return hosts | set(self.extra_allowed_hosts)
+
+    @property
+    def allowed_origins(self) -> set[str]:
+        return {f"http://{h}" for h in self.allowed_hosts}
 
     @property
     def app_db(self) -> Path:

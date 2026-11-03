@@ -13,9 +13,10 @@ def client(tmp_path, provider, retry):
     s = Settings()
     s.data_dir = tmp_path
     s.first_run_cap = 50
+    s.extra_allowed_hosts = ("testserver",)
     state = build_state(s, provider=provider, retry=retry)
     state.scanner.page_size, state.scanner.meta_batch = 200, 50
-    return TestClient(create_app(state)), state
+    return TestClient(create_app(state), headers={"X-Sift": "1"}), state
 
 
 def wait(c, path, done=lambda d: d["status"] != "running", timeout=30):
@@ -73,7 +74,7 @@ def test_full_flow(client):
     run2 = wait(c, f"/api/runs/{run2['id']}")
     assert run2["status"] == "completed" and run2["plan_remaining"] == 0
     audit = c.get(f"/api/runs/{run2['id']}/audit").json()
-    assert audit and all(a["status"] in ("confirmed", "skipped", "failed") for a in audit)
+    assert audit and all(a["status"] in ("attempted", "confirmed", "skipped", "failed") for a in audit)
 
 
 def test_scan_cancel_and_resume_via_api(client):
@@ -107,3 +108,28 @@ def test_concurrent_jobs_rejected(client):
     assert c.post("/api/scan").status_code == 409
     c.post("/api/scan/cancel")
     wait(c, "/api/scan")
+
+
+def test_cross_site_and_rebinding_requests_rejected(client):
+    c, _ = client
+    raw = TestClient(c.app)  # no X-Sift header
+    assert raw.post("/api/scan").status_code == 403
+    assert c.post("/api/scan", headers={"Origin": "https://evil.example"}).status_code == 403
+    assert c.get("/api/status", headers={"Host": "attacker.example"}).status_code == 403
+    assert c.post("/api/scan", headers={"Host": "attacker.example"}).status_code == 403
+    assert raw.get("/api/status").status_code == 200  # reads from the local UI still work
+    c.post("/api/scan/cancel")
+
+
+def test_execute_refused_while_scan_incomplete(client):
+    c, state = client
+    c.post("/api/scan")
+    wait(c, "/api/scan")
+    plan = c.post("/api/plans", json={"items": [{"rec_id": "promotions"}]}).json()
+    c.post(f"/api/plans/{plan['id']}/approve", json={"confirm_hash": plan["ids_hash"]})
+    state.provider.latency = 0.01
+    c.post("/api/scan")  # a fresh scan is now running/partial
+    c.post("/api/scan/cancel")
+    wait(c, "/api/scan")
+    r = c.post(f"/api/plans/{plan['id']}/execute")
+    assert r.status_code == 400 and "scan" in r.json()["detail"]

@@ -18,7 +18,8 @@ from .providers.base import MailProvider, MessageMeta, ProviderError
 from .retry import RetryPolicy
 
 CHUNK = 500  # <= Gmail's 1,000-id batchModify limit
-RUNNABLE_PLAN = ("approved", "partial", "cancelled", "completed")
+# A cancelled plan is not runnable again: cancelling withdraws the approval. Build and approve a new plan.
+RUNNABLE_PLAN = ("approved", "partial", "completed")
 
 
 class ExecutionError(Exception):
@@ -50,6 +51,10 @@ class Executor:
                 raise ExecutionError("plan contents changed after approval; refusing to run")
             if c.execute("SELECT 1 FROM runs WHERE status='running'").fetchone():
                 raise ExecutionError("another run is in progress")
+            last = c.execute("SELECT status FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+            if last is None or last["status"] != "completed":
+                # protection context (your sent mail, rules) comes from the last scan; it must be complete
+                raise ExecutionError("the latest scan is not complete; finish or resume it before running a plan")
             cap = None if unlocked(self.db) else self.first_run_cap
             cur = c.execute("INSERT INTO runs(kind,plan_id,status,cap,started_at,current_op) "
                             "VALUES ('execute',?,'running',?,?,'starting')", (plan_id, cap, now_iso()))
@@ -124,6 +129,9 @@ class Executor:
         try:
             label_id = self.retry.call(lambda: self.provider.ensure_label(run["label_name"]))
             self._set(run_id, label_id=label_id)
+            with self.db.connect() as c:
+                self._audit(c, run_id, plan_id, None, "ensure_label", None, None, "confirmed",
+                            f"{run['label_name']} -> {label_id}")
             for i in range(0, len(work), self.chunk):
                 if self._cancelled(run_id):
                     status = "cancelled"
@@ -147,10 +155,16 @@ class Executor:
                       (status, now_iso(), "finished" if status != "cancelled" else "cancelled by you", run_id))
         return status
 
-    def _revalidate(self, mid: str, rec_id: str, action: str, m: MessageMeta | None, spec: dict, ctx) -> str | None:
+    def _revalidate(self, mid: str, rec_id: str, action: str, m: MessageMeta | None, spec: dict, ctx,
+                    replied_threads: set[str]) -> str | None:
         """Return a skip reason, or None if the message may still be changed."""
         if m is None:
             return "no longer exists"
+        if m.thread_id in replied_threads:
+            return "newly protected: thread contains your reply"
+        if "INBOX" not in m.labels and "TRASH" not in m.labels:
+            # The plan only ever selects Inbox mail; if you've filed it elsewhere since, leave it alone.
+            return "no longer in Inbox"
         reason = protection_reason(labels=m.labels, thread_id=m.thread_id, from_addr=m.from_addr,
                                    subject=m.subject, ctx=ctx)
         if reason:
@@ -168,16 +182,27 @@ class Executor:
 
     def _process_chunk(self, run_id, plan_id, chunk, spec, ctx, label_id, frozen) -> bool:
         ids = [w[0] for w in chunk]
-        assert set(ids) <= frozen  # revalidation only ever narrows the frozen set
+        if not set(ids) <= frozen:  # revalidation only ever narrows the frozen set
+            raise ExecutionError("work list contains ids outside the approved plan")
         before = self._fetch(ids)
+        threads = sorted({m.thread_id for m in before.values()})
+        replied = self.retry.call(lambda: self.provider.threads_with_sent(threads)) if threads else set()
+        with self.db.connect() as c:  # labels applied by earlier runs of this same plan
+            own_labels = {r[0] for r in c.execute("SELECT label_id FROM runs WHERE plan_id=? AND kind='execute' "
+                                                  "AND label_id IS NOT NULL", (plan_id,))}
         to_archive, to_trash, skipped, noop = [], [], [], []
         for mid, rec_id, action in chunk:
             m = before.get(mid)
-            why = self._revalidate(mid, rec_id, action, m, spec, ctx)
+            # Idempotency: an earlier run of this plan already applied the change (e.g. crashed before recording it).
+            if m is not None and own_labels & set(m.labels) and (
+                    (action == "archive" and "INBOX" not in m.labels) or (action == "trash" and "TRASH" in m.labels)):
+                noop.append((mid, action))
+                continue
+            why = self._revalidate(mid, rec_id, action, m, spec, ctx, replied)
             if why:
                 skipped.append((mid, action, why))
-            elif (action == "archive" and "INBOX" not in m.labels) or (action == "trash" and "TRASH" in m.labels):
-                noop.append((mid, action))
+            elif action == "trash" and "TRASH" in m.labels:
+                skipped.append((mid, action, "already in Trash"))
             else:
                 (to_archive if action == "archive" else to_trash).append(mid)
         with self.db.tx() as c:
@@ -193,6 +218,13 @@ class Executor:
 
         ok = True
         errors: dict[str, str] = {}
+        if to_archive or to_trash:
+            # Write-ahead: record intent before calling the provider, so a crash mid-call still leaves a trail
+            # that restore can follow.
+            with self.db.tx() as c:
+                for mid in to_archive + to_trash:
+                    self._audit(c, run_id, plan_id, mid, "archive" if mid in to_archive else "trash",
+                                before[mid].labels, None, "attempted")
         if to_archive:
             self._set(run_id, current_op=f"archiving {len(to_archive)} messages")
             self._bump(run_id, attempted=len(to_archive))
@@ -256,8 +288,9 @@ class Executor:
             run = dict(c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
             src = run["source_run_id"]
             work = [(r["message_id"], r["action"]) for r in c.execute(
-                "SELECT message_id, action FROM audit_log WHERE run_id=? AND status='confirmed' "
-                "AND action IN ('archive','trash') ORDER BY id", (src,))]
+                "SELECT message_id, MIN(action) action FROM audit_log WHERE run_id=? "
+                "AND status IN ('attempted','confirmed') AND action IN ('archive','trash') "
+                "GROUP BY message_id ORDER BY MIN(id)", (src,))]
         label_id = run["label_id"]
         self._set(run_id, total=len(work))
         status = "completed"

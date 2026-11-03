@@ -6,7 +6,8 @@ import logging
 import time
 from dataclasses import dataclass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .analysis import DEFAULT_OLDER_THAN, aggregate, apply_protection, build_recommendations, classify
@@ -81,6 +82,22 @@ def _ms_to_iso(ms):
 def create_app(state: State) -> FastAPI:
     app = FastAPI(title="Sift", version="0.1.0")
     app.state.sift = state
+    allowed_hosts = state.settings.allowed_hosts
+    allowed_origins = state.settings.allowed_origins
+
+    @app.middleware("http")
+    async def local_only(request: Request, call_next):
+        """Block other websites and DNS-rebinding pages from driving this local API.
+        Every request needs a local Host; every state-changing request also needs the custom
+        X-Sift header (which a cross-site page cannot send without a CORS preflight we never allow)
+        and, if the browser sent one, a local Origin."""
+        if request.headers.get("host", "") not in allowed_hosts:
+            return JSONResponse({"detail": "forbidden host"}, status_code=403)
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = request.headers.get("origin")
+            if request.headers.get("x-sift") != "1" or (origin and origin not in allowed_origins):
+                return JSONResponse({"detail": "forbidden: cross-site request"}, status_code=403)
+        return await call_next(request)
     db = state.db
     recover_interrupted(db)
 
@@ -95,7 +112,8 @@ def create_app(state: State) -> FastAPI:
                 "synthetic": state.provider.synthetic,
                 "classifier": {"name": state.classifier.name, "label": state.classifier.label,
                                "uses_ai": state.classifier.uses_ai},
-                "mode": "read-only (mock)" if state.provider.synthetic else "read-only",
+                "mode": ("synthetic mailbox: approved plans change synthetic data only" if state.provider.synthetic
+                         else "read-only"),
                 "full_runs_unlocked": unlocked(db), "busy": state.jobs.busy()}
 
     @app.get("/api/dashboard")

@@ -119,9 +119,11 @@ def test_cancel_mid_run_leaves_rest_pending(db, provider, scanned, executor, unl
         pstatus = c.execute("SELECT status FROM plans WHERE id=?", (p["id"],)).fetchone()[0]
     assert pending == p["total"] - executor.chunk
     assert pstatus == "cancelled"
-    # resuming finishes the remainder
+    # cancelling withdrew approval; a new plan picks up exactly the remainder
     provider.batch_modify = real
-    rid2, status = run(executor, p["id"])
+    p2 = approved_plan(db)
+    assert p2["total"] == pending
+    rid2, status = run(executor, p2["id"])
     assert status == "completed" and run_row(db, rid2)["confirmed"] == pending
 
 
@@ -167,12 +169,37 @@ def test_idempotent_rerun_makes_no_calls(db, provider, scanned, executor, unlock
 
 
 def test_already_applied_change_is_not_reapplied(db, provider, scanned, executor, unlocked):
-    """Crash after the API call but before the DB write: the re-run notices and makes no call."""
+    """Change landed but wasn't recorded (confirm read failed): the re-run notices and makes no call."""
+    p = approved_plan(db)
+    real = provider.get_metadata
+    calls = {"n": 0}
+
+    def fail_confirm(batch):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise TransientError(500, "lost")
+        return real(batch)
+
+    budget, executor.retry.max_attempts = executor.retry.max_attempts, 1
+    provider.get_metadata = fail_confirm
+    rid1, _ = run(executor, p["id"])
+    provider.get_metadata = real
+    executor.retry.max_attempts = budget
+    lost = run_row(db, rid1)["failed"]
+    assert lost == executor.chunk
+    before = provider.calls["modify"]
+    rid2, status = run(executor, p["id"])
+    assert status == "completed"
+    assert run_row(db, rid2)["already_done"] == lost
+    assert provider.calls["modify"] == before  # nothing re-applied
+
+
+def test_message_archived_outside_sift_is_skipped(db, provider, scanned, executor, unlocked):
     p = approved_plan(db)
     ids = plan_ids(db, p["id"])
-    provider.batch_modify(ids[:10], add=[], remove=["INBOX"])  # applied out-of-band
+    provider.batch_modify(ids[:10], add=[], remove=["INBOX"])  # you archived these yourself
     rid, _ = run(executor, p["id"])
-    assert run_row(db, rid)["already_done"] == 10
+    assert run_row(db, rid)["skipped"] == 10
     assert run_row(db, rid)["confirmed"] == p["total"] - 10
 
 
@@ -228,7 +255,7 @@ def test_audit_log_complete_and_append_only(db, provider, scanned, executor, unl
     provider._test_remove(ids[0])
     rid, _ = run(executor, p["id"])
     with db.connect() as c:
-        rows = c.execute("SELECT * FROM audit_log WHERE run_id=?", (rid,)).fetchall()
+        rows = c.execute("SELECT * FROM audit_log WHERE run_id=? AND message_id IS NOT NULL", (rid,)).fetchall()
         assert {r["message_id"] for r in rows} == set(ids)  # every plan message has an entry
         for r in rows:
             assert r["ts"] and r["plan_id"] == p["id"] and r["action"] == "archive"
@@ -266,3 +293,78 @@ def test_only_one_run_at_a_time(db, scanned, executor, unlocked):
     p2 = approved_plan(db, rec="newsletters")
     with pytest.raises(ExecutionError, match="in progress"):
         executor.create_run(p2["id"])
+
+
+def test_trash_skips_message_filed_elsewhere_after_approval(db, provider, scanned, executor, unlocked):
+    """Safety review B1: mail moved out of the Inbox after approval must not be trashed."""
+    p = approved_plan(db, rec="spam", action="trash")
+    mid = plan_ids(db, p["id"])[0]
+    lab = [l for l in labels_of(provider, [mid])[mid] if l != "INBOX"]
+    provider._test_set_labels(mid, lab + ["CATEGORY_PERSONAL"])
+    rid, _ = run(executor, p["id"])
+    assert "TRASH" not in labels_of(provider, [mid])[mid]
+    with db.connect() as c:
+        reason = c.execute("SELECT reason FROM plan_messages WHERE plan_id=? AND message_id=?", (p["id"], mid)).fetchone()[0]
+    assert reason == "no longer in Inbox"
+
+
+def test_reply_sent_after_approval_protects_thread(db, provider, scanned, executor, unlocked):
+    """Safety review B2: a reply in the thread after approval is detected at run time."""
+    p = approved_plan(db)
+    mid = plan_ids(db, p["id"])[0]
+    tid = provider.get_metadata([mid])[0].thread_id
+    with provider._conn() as c:
+        c.execute("INSERT INTO mbox VALUES ('myreply1', ?, 'you@sift-demo.test', 'You', '[]', 'Re: hi', '', 1, "
+                  "'[\"SENT\"]', NULL, NULL, NULL)", (tid,))
+    run(executor, p["id"])
+    assert "INBOX" in labels_of(provider, [mid])[mid]
+    with db.connect() as c:
+        reason = c.execute("SELECT reason FROM plan_messages WHERE plan_id=? AND message_id=?", (p["id"], mid)).fetchone()[0]
+    assert reason == "newly protected: thread contains your reply"
+
+
+def test_cancelled_plan_cannot_be_rerun(db, provider, scanned, executor, unlocked):
+    """Safety review S2: cancelling withdraws approval."""
+    p = approved_plan(db)
+    rid = executor.create_run(p["id"])
+    executor.request_cancel(rid)
+    assert executor.run(rid) == "cancelled"
+    with pytest.raises(ExecutionError, match="cancelled"):
+        executor.create_run(p["id"])
+
+
+def test_write_ahead_audit_lets_restore_undo_unconfirmed_changes(db, provider, scanned, executor, unlocked):
+    """Safety review S4: if confirmation fails after the change landed, restore still finds it."""
+    p = approved_plan(db)
+    ids = plan_ids(db, p["id"])
+    real = provider.get_metadata
+    calls = {"n": 0}
+
+    def flaky_after_modify(batch):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the confirm read after the first batch_modify
+            raise TransientError(500, "confirm failed")
+        return real(batch)
+
+    retry_budget = executor.retry.max_attempts
+    provider.faults["get"] = []
+    executor.retry.max_attempts = 1
+    provider.get_metadata = flaky_after_modify
+    rid, status = run(executor, p["id"])
+    provider.get_metadata = real
+    executor.retry.max_attempts = retry_budget
+    assert status == "partial"
+    with db.connect() as c:
+        attempted = c.execute("SELECT COUNT(*) FROM audit_log WHERE run_id=? AND status='attempted'", (rid,)).fetchone()[0]
+    assert attempted == p["total"]
+    rest = executor.create_restore(rid)
+    executor.restore(rest)
+    assert all("INBOX" in l for l in labels_of(provider, ids).values())
+
+
+def test_label_creation_is_audited(db, provider, scanned, executor, unlocked):
+    p = approved_plan(db)
+    rid, _ = run(executor, p["id"])
+    with db.connect() as c:
+        row = c.execute("SELECT detail FROM audit_log WHERE run_id=? AND action='ensure_label'", (rid,)).fetchone()
+    assert row and row[0].startswith("Sift/")

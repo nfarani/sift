@@ -132,6 +132,17 @@ CREATE TRIGGER IF NOT EXISTS plan_messages_frozen_update
 BEFORE UPDATE OF plan_id, message_id, action, rec_id ON plan_messages
 BEGIN SELECT RAISE(ABORT, 'plan is frozen: cannot change message scope'); END;
 
+-- Once approved, a plan's contents and fingerprint cannot change, and it can never go back to draft.
+CREATE TRIGGER IF NOT EXISTS plans_frozen_fields
+BEFORE UPDATE OF spec, total, ids_hash, summary, inbox_before, created_at ON plans
+WHEN OLD.status IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'plan is frozen: cannot change its contents'); END;
+
+CREATE TRIGGER IF NOT EXISTS plans_no_redraft
+BEFORE UPDATE OF status ON plans
+WHEN NEW.status = 'draft' AND OLD.status IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'plan is frozen: cannot return to draft'); END;
+
 CREATE TABLE IF NOT EXISTS runs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     kind             TEXT NOT NULL,           -- execute | restore
@@ -164,7 +175,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action        TEXT NOT NULL,
     before_labels TEXT,
     after_labels  TEXT,
-    status        TEXT NOT NULL,              -- confirmed | failed | skipped | unverified
+    status        TEXT NOT NULL,              -- attempted (write-ahead) | confirmed | failed | skipped
     detail        TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_audit_run ON audit_log(run_id);

@@ -36,7 +36,7 @@ export default function RunScreen({ runId, go, onChange, status }: { runId: numb
       </div>
 
       <section className="card">
-        <div className="current-op">{running ? run.current_op : run.status === "cancelled" ? "Cancelled. Unprocessed messages stay pending in the plan." : "Finished"}</div>
+        <div className="current-op">{running ? run.current_op : run.status === "cancelled" ? "Cancelled. Cancelling withdraws the approval; build a new plan to continue." : "Finished"}</div>
         <div className="progress"><div className={`progress-fill ${running ? "live" : ""}`} style={{ width: `${run.total ? (100 * processed) / run.total : 100}%` }} /></div>
         <div className="stats stats-5">
           <Mini label="Processed" value={n(processed)} hint={`of ${n(run.total)}`} />
@@ -107,8 +107,8 @@ function Results({ run, status, onRestore, onUnlock, onContinue, go }: {
       <div className="row end">
         {!isRestore && run.confirmed > 0 && !restored && <button className="btn btn-ghost" onClick={onRestore}>Restore these {n(run.confirmed)} messages</button>}
         {canUnlock && <button className="btn btn-primary" onClick={onUnlock}>Restore verified · unlock full runs</button>}
-        {status?.full_runs_unlocked && (run.plan_remaining ?? 0) > 0 && <button className="btn btn-primary" onClick={onContinue}>Run the remaining {n(run.plan_remaining)} in plan #{run.plan_id}</button>}
-        {status?.full_runs_unlocked && isRestore && !(run.plan_remaining ?? 0) && <button className="btn btn-ghost" onClick={() => go("recommendations")}>Back to recommendations</button>}
+        {status?.full_runs_unlocked && run.plan?.status === "partial" && (run.plan_remaining ?? 0) > 0 && <button className="btn btn-primary" onClick={onContinue}>Run the remaining {n(run.plan_remaining)} in plan #{run.plan_id}</button>}
+        {status?.full_runs_unlocked && isRestore && !(run.plan?.status === "partial" && (run.plan_remaining ?? 0) > 0) && <button className="btn btn-ghost" onClick={() => go("recommendations")}>Back to recommendations</button>}
         <a className="btn btn-link" href={`/api/runs/${run.id}/audit`} target="_blank" rel="noreferrer">Audit log (JSON)</a>
       </div>
     </section>

@@ -76,6 +76,11 @@ class MailProvider(ABC):
     def get_metadata(self, ids: list[str]) -> list[MessageMeta]:
         """Metadata only, never bodies. Unknown ids are omitted from the result. Must not mark read."""
 
+    @abstractmethod
+    def threads_with_sent(self, thread_ids: list[str]) -> set[str]:
+        """Of the given threads, those that currently contain a message you sent
+        (Gmail: threads.get format=minimal, look for the SENT label). Read-only."""
+
     # --- write methods: executor only ------------------------------------
     @abstractmethod
     def ensure_label(self, name: str) -> str:

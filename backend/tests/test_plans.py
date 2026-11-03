@@ -92,3 +92,13 @@ def test_later_scan_does_not_change_approved_plan(db, scanned, scanner):
     sid = scanner.start()
     scanner.run(sid)
     assert sorted(plan_ids(db, p["id"])) == before
+
+
+def test_approved_plan_fields_and_status_are_frozen(db, scanned):
+    """Safety review S3."""
+    p = approved_plan(db)
+    with db.connect() as c:
+        for stmt in ("UPDATE plans SET ids_hash='x' WHERE id=?", "UPDATE plans SET spec='[]' WHERE id=?",
+                     "UPDATE plans SET total=1 WHERE id=?", "UPDATE plans SET status='draft' WHERE id=?"):
+            with pytest.raises(sqlite3.IntegrityError, match="frozen"):
+                c.execute(stmt, (p["id"],))
