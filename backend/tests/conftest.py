@@ -14,6 +14,12 @@ class Sleeps(list):
         self.append(s)
 
 
+@pytest.fixture(autouse=True)
+def no_real_anthropic_key(monkeypatch):
+    """sift.config loads the repo .env; tests must never see (or spend on) the real key."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+
 @pytest.fixture
 def sleeps():
     return Sleeps()
