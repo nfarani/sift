@@ -69,8 +69,12 @@ def estimate(db: Database, clf: ClaudeClassifier, cap_usd: float) -> dict:
                      "(160 chars) per sender; no bodies, no attachments"}
 
 
-def run(db: Database, clf: ClaudeClassifier, run_id: int, user_email: str) -> str:
+def run(db: Database, clf: ClaudeClassifier, run_id: int, user_email: str, max_groups: int | None = None) -> str:
+    """max_groups: a within-cap run covers only the biggest groups the estimate said fit, so each gets both
+    passes; without it the first pass would sweep every group and spend the cap before any second opinion."""
     groups = candidates(db)
+    if max_groups is not None:
+        groups = groups[:max_groups]
     with db.connect() as c:
         c.execute("UPDATE ai_runs SET groups_total=?, current_op='classifying' WHERE id=?", (len(groups), run_id))
 

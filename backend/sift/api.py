@@ -534,7 +534,9 @@ def create_app(state: State) -> FastAPI:
                 c.execute("UPDATE ai_runs SET status='failed', error=?, finished_at=? WHERE id=?",
                           (msg[:300], now_iso(), rid))
 
-        state.jobs.submit("ai", lambda: ai_run.run(db, state.claude, rid, state.provider.account_email()), crash)
+        limit = est["within_cap"]["groups"] if body.within_cap else None
+        state.jobs.submit("ai", lambda: ai_run.run(db, state.claude, rid, state.provider.account_email(), limit),
+                          crash)
         return _ai_run_row(rid)
 
     @app.get("/api/ai/run")

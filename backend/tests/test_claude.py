@@ -448,3 +448,18 @@ def test_bad_key_stops_run_at_first_batch(db, scanned):
 def test_short_sender_fragment_rejected():
     with pytest.raises(SpecError):
         parse_spec({**SPEC, "categories": [], "subject_excludes_any": [], "sender_contains": ["co"]})
+
+
+def test_within_cap_run_covers_only_estimated_groups_with_both_passes(db, scanned):
+    """A within-cap run sends only the biggest groups the estimate covered, and they still get the
+    second-opinion pass (the first pass must not sweep every group and use up the cap first)."""
+    clf, client = make(db, labeller(conf=0.4))
+    biggest = [g.sender for g in ai_run.candidates(db)][:3]
+    ai_run.run(db, clf, _new_run(db), "you@sift-demo.test", max_groups=3)
+    sent = "".join(c["messages"][0]["content"] for c in client.calls)
+    others = [g.sender for g in ai_run.candidates(db)]  # unlabelled ones are still candidates
+    assert all(s in sent for s in biggest)
+    assert not any(json.dumps(s) in sent for s in others)
+    assert any(c["model"] == "claude-opus-5-5" for c in client.calls)
+    with db.connect() as c:
+        assert {r[0] for r in c.execute("SELECT sender FROM ai_labels")} == set(biggest)
