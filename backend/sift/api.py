@@ -286,6 +286,7 @@ def create_app(state: State) -> FastAPI:
         vocab["at"] = time.time()
         with db.connect() as c:
             names = [r[0] for r in c.execute("SELECT DISTINCT display_name FROM sender_groups WHERE display_name LIKE '% %'")]
+            masker.learn_addresses(r[0] for r in c.execute("SELECT sender FROM sender_groups"))
         masker.learn(db.get_setting("account.email") or (state.provider.account_email() if state.provider and
                                                           state.provider.synthetic else None), names)
 

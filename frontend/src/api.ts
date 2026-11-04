@@ -48,6 +48,8 @@ export interface Status {
   full_runs_unlocked: boolean;
   busy: boolean;
   mode: string;
+  // Demo mode: the backend masks addresses, names and subjects in every /api response while this is on.
+  demo_mode: boolean;
 }
 
 export type CleanupState = "disabled" | "enabling" | "enabled" | "error" | "reauth_required";
@@ -256,6 +258,7 @@ export interface Run {
   skipped: number;
   already_done: number;
   current_op: string | null;
+  cancel_requested?: number; // 1 once you asked to cancel; the executor stops before its next batch
   started_at: string;
   finished_at: string | null;
   error: string | null;
@@ -267,4 +270,48 @@ export interface Run {
   inbox_now: number;
   restores: { id: number; status: string; confirmed: number; failed: number }[];
   restorable: number; // messages this run attempted to change (confirmed or not)
+}
+
+/** GET /api/report: before/after summary from the runs table and the audit log. */
+export interface ReportRun {
+  id: number;
+  kind: "execute" | "restore";
+  plan_id: number | null;
+  source_run_id: number | null;
+  status: Run["status"];
+  label_name: string | null;
+  started_at: string;
+  finished_at: string | null;
+  total: number;
+  attempted: number;
+  confirmed: number;
+  failed: number;
+  skipped: number;
+  already_done: number;
+  error: string | null;
+  duration_s: number | null;
+  by_action: Record<string, number>;
+  inbox_before: number | null;
+}
+
+export interface Report {
+  inbox_before: number | null;
+  inbox_now: number;
+  totals: {
+    archived_confirmed: number;
+    trashed_confirmed: number;
+    restored_confirmed: number;
+    attempted: number;
+    failed: number;
+    skipped_at_run_time: number;
+    duration_s: number;
+    runs_with_errors: number;
+  };
+  runs: ReportRun[];
+  skip_reasons: Record<string, number>;
+  errors: { run_id: number; action: string; detail: string; n: number }[];
+  unsubscribe: {
+    attempted: number; accepted: number; not_confirmed: number; failed: number;
+    refused: number; manual: number; simulated: number;
+  };
 }

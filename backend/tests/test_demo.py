@@ -59,3 +59,20 @@ def test_demo_off_by_default_shows_real_data(client):  # noqa: F811
     assert c.get("/api/status").json()["demo_mode"] is False
     addrs, _, _ = _real_values(state)
     assert any(a in c.get("/api/recommendations").text for a in addrs)
+
+
+def test_masked_sender_survives_restart_and_unknown_masks_are_refused(client):  # noqa: F811
+    from sift.api import create_app
+    from fastapi.testclient import TestClient
+    c, state = client
+    c.post("/api/scan")
+    wait(c, "/api/scan")
+    c.post("/api/demo", json={"enabled": True})
+    rec = next(r for r in c.get("/api/recommendations").json()["items"] if r["action"] == "archive")
+    masked = rec["senders"][0]["sender"]
+    c2 = TestClient(create_app(state), headers={"X-Sift": "1"})  # fresh masker, as after a restart
+    p = c2.post("/api/plans", json={"items": [{"rec_id": rec["id"], "excluded_senders": [masked]}]})
+    assert p.status_code == 200
+    bogus = "z***dead@nowhere.example"
+    r = c2.post("/api/plans", json={"items": [{"rec_id": rec["id"], "excluded_senders": [bogus]}]})
+    assert r.status_code == 409 and "lost track" in r.json()["detail"]

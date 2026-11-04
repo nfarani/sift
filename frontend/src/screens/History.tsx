@@ -15,7 +15,7 @@ export default function History({ go }: { go: (r: string) => void }) {
             <tbody>
               {runs.map((r) => (
                 <tr key={r.id} onClick={() => go(`run/${r.id}`)}>
-                  <td>#{r.id}</td>
+                  <td><a href={`#/run/${r.id}`} onClick={(e) => e.stopPropagation()}>#{r.id}</a></td>
                   <td>{r.kind === "restore" ? `restore of #${r.source_run_id}` : `plan #${r.plan_id}`}</td>
                   <td><span className={`status status-${r.status}`}>{r.status}</span></td>
                   <td className="num">{n(r.attempted)}</td>

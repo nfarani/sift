@@ -1,49 +1,110 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, Run, Status } from "../api";
 import { usePoll } from "../hooks";
 import { dur, n, seconds } from "../format";
 
+/** Re-renders every second while `on`, so elapsed time is a real clock. It never moves a count. */
+function useClock(on: boolean) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!on) return;
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [on]);
+}
+
 export default function RunScreen({ runId, go, onChange, status }: { runId: number; go: (r: string) => void; onChange: () => void; status: Status | null }) {
-  const { data: run, reload } = usePoll(() => api.get<Run>(`/runs/${runId}`), 600, [runId]);
+  // Poll once a second while the run is live, then stop: the finished run doesn't change.
+  const [live, setLive] = useState(true);
+  const { data: run, reload } = usePoll(() => api.get<Run>(`/runs/${runId}`), live ? 1000 : null, [runId]);
   const [err, setErr] = useState<string | null>(null);
+  const [askCancel, setAskCancel] = useState(false);
+  const running = run?.status === "running";
+  useEffect(() => { if (run && run.status !== "running") setLive(false); }, [run]);
+  useClock(running);
 
   if (!run) return <div className="loading">Loading…</div>;
-  const running = run.status === "running";
   const processed = run.confirmed + run.failed + run.skipped + run.already_done;
   const remaining = Math.max(0, run.total - processed);
   const isRestore = run.kind === "restore";
+  const stopping = running && !!run.cancel_requested;
+  const w = (k: number) => (run.total ? `${Math.min(100, (100 * k) / run.total)}%` : "0%");
 
   const act = async (fn: () => Promise<unknown>) => {
     setErr(null);
     try { await fn(); onChange(); } catch (e) { setErr((e as Error).message); }
   };
+  const cancel = () => act(async () => { await api.post(`/runs/${run.id}/cancel`); setAskCancel(false); await reload(); });
 
   return (
     <div className="stack-lg narrow">
       <div className="page-head">
         <div>
           <h1>{isRestore ? `Restore of run #${run.source_run_id}` : `Run #${run.id}`}{" "}
-            <span className={`status status-${run.status}`}>{run.status}</span></h1>
+            <span className={`status status-${stopping ? "cancelled" : run.status}`}>{stopping ? "stopping" : run.status}</span></h1>
           <p className="muted">
             {run.label_name && <>Label <code>{run.label_name}</code> · </>}
-            started {run.started_at.slice(11, 19)} UTC · {dur(seconds(run.started_at, run.finished_at))}
+            started {run.started_at.slice(11, 19)} UTC
             {run.cap != null && !isRestore && <> · capped at {n(run.cap)}</>}
           </p>
         </div>
         <div className="row">
-          {running && <button className="btn btn-ghost" onClick={() => act(() => api.post(`/runs/${run.id}/cancel`).then(reload))}>Cancel</button>}
+          {running && !askCancel && !stopping && <button className="btn btn-ghost" onClick={() => setAskCancel(true)}>Cancel run…</button>}
         </div>
       </div>
 
+      {askCancel && running && !stopping && (
+        <section className="card cancel-panel" aria-labelledby="cancel-h">
+          <h2 id="cancel-h">Cancel this {isRestore ? "restore" : "run"}?</h2>
+          <ul className="explain-list">
+            <li>Sift finishes the batch it is working on (up to 500 messages), then stops. Nothing after that batch is sent{status?.synthetic ? "" : " to Gmail"}.</li>
+            {isRestore ? (
+              <li>Messages already restored stay in your Inbox. The rest stay where they are, with their Sift label; you can start the restore again from run #{run.source_run_id}.</li>
+            ) : (
+              <>
+                <li><strong>Messages not reached yet stay untouched</strong> in your Inbox.</li>
+                <li>Messages already changed keep their label{run.label_name && <> <code>{run.label_name}</code></>} and can be restored from this page.</li>
+                <li>The plan's approval is withdrawn. To do the rest later, build and approve a new plan.</li>
+              </>
+            )}
+          </ul>
+          <div className="row" style={{ marginTop: 14 }}>
+            <button className="btn btn-danger" onClick={cancel}>Stop after this batch</button>
+            <button className="btn btn-ghost" onClick={() => setAskCancel(false)} autoFocus>Keep running</button>
+          </div>
+        </section>
+      )}
+
       <section className="card">
-        <div className="current-op">{running ? run.current_op : run.status === "cancelled" ? "Cancelled. Cancelling withdraws the approval; build a new plan to continue." : "Finished"}</div>
-        <div className="progress"><div className={`progress-fill ${running ? "live" : ""}`} style={{ width: `${run.total ? (100 * processed) / run.total : 100}%` }} /></div>
+        <div className="run-op" aria-live="polite">
+          <span className="current-op">
+            {stopping ? "Stopping after the current batch…" : running ? run.current_op
+              : run.status === "cancelled"
+                ? (isRestore ? "Cancelled. Messages already restored stay in your Inbox." : "Cancelled by you. Messages not reached were left untouched; the approval is withdrawn, so build a new plan to continue.")
+                : "Finished"}
+          </span>
+          <span className="muted small">{running ? "Elapsed" : "Took"} {dur(seconds(run.started_at, run.finished_at))}</span>
+        </div>
+        <div className="progress progress-stack" role="progressbar" aria-label="Messages processed"
+          aria-valuemin={0} aria-valuemax={run.total} aria-valuenow={processed}>
+          <div className="seg-attempted" style={{ width: w(run.attempted) }} />
+          <div className="seg seg-confirmed" style={{ width: w(run.confirmed) }} />
+          <div className="seg seg-skipped" style={{ width: w(run.skipped + run.already_done) }} />
+          <div className="seg seg-failed" style={{ width: w(run.failed) }} />
+        </div>
+        <div className="progress-caption row">
+          <span>{n(processed)} of {n(run.total)} processed</span>
+          <span className="legend"><i className="seg-confirmed" />confirmed</span>
+          {running && <span className="legend"><i className="seg-attempted" />sent, awaiting confirmation</span>}
+          <span className="legend"><i className="seg-skipped" />skipped or already done</span>
+          {run.failed > 0 && <span className="legend"><i className="seg-failed" />failed</span>}
+        </div>
         <div className="stats stats-5">
-          <Mini label="Processed" value={n(processed)} hint={`of ${n(run.total)}`} />
-          <Mini label="Confirmed" value={n(run.confirmed)} tone="good" hint={`of ${n(run.attempted)} attempted`} />
+          <Mini label="Attempted" value={n(run.attempted)} hint={status?.synthetic ? "sent to the mailbox" : "sent to Gmail"} />
+          <Mini label="Confirmed" value={n(run.confirmed)} tone="good" hint="re-read in the new state" />
           <Mini label="Failed" value={n(run.failed)} tone={run.failed ? "bad" : undefined} />
           <Mini label="Skipped" value={n(run.skipped + run.already_done)} hint="re-checked and left alone" />
-          <Mini label="Remaining" value={n(remaining)} />
+          <Mini label={running ? "Remaining" : "Not reached"} value={n(remaining)} hint={running ? undefined : remaining ? "left untouched" : undefined} />
         </div>
         {run.error && <div className="notice notice-error">{run.error}</div>}
         {running && err && <div className="notice notice-error" role="alert">{err}</div>}
@@ -138,6 +199,7 @@ function Results({ run, status, err, onRestore, onUnlock, onContinue, go }: {
         {status?.full_runs_unlocked && run.plan?.status === "partial" && (run.plan_remaining ?? 0) > 0 && <button className="btn btn-primary" onClick={onContinue}>Run the remaining {n(run.plan_remaining)} in plan #{run.plan_id}</button>}
         {status?.full_runs_unlocked && isRestore && !(run.plan?.status === "partial" && (run.plan_remaining ?? 0) > 0) && <button className="btn btn-ghost" onClick={() => go("recommendations")}>Back to recommendations</button>}
         <a className="btn btn-link" href={`/api/runs/${run.id}/audit`} target="_blank" rel="noreferrer">Audit log (JSON)</a>
+        <button className="btn btn-ghost" onClick={() => go("report")}>See the full report</button>
       </div>
     </section>
   );

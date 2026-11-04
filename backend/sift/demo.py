@@ -21,6 +21,13 @@ import threading
 EMAIL = re.compile(r"[A-Za-z0-9._%+\-=]+@([A-Za-z0-9\-]+\.)+[A-Za-z]{2,}")
 DIGITS = re.compile(r"\d{6,}")  # order numbers, codes, phones; leaves dates and run labels readable
 HIDDEN = "[hidden in demo mode]"
+MASKED = re.compile(r"^[a-z0-9]?\*\*\*[0-9a-f]{4}@[a-z0-9.\-]+$")
+# Filter terms you typed yourself (Ask): shown and saved as typed.
+USER_TERMS = {"sender_contains", "subject_contains_any", "subject_excludes_any", "text", "query"}
+
+
+class UnknownMasked(ValueError):
+    """A masked address came back that this backend didn't hand out (e.g. after a restart)."""
 # JSON keys whose values are message content: replaced entirely.
 CONTENT_KEYS = {"subject", "snippet", "subjects", "snippets", "sample_subjects", "subject_contains"}
 # JSON keys whose values are display names.
@@ -32,7 +39,7 @@ def _passthrough(key: str | None) -> bool:
     if not key:
         return False
     k = key.lower()
-    return k == "id" or k.endswith(("_id", "_ids", "hash", "_at", "status", "state", "kind", "action"))
+    return k in USER_TERMS or k == "id" or k.endswith(("_id", "_ids", "hash", "_at", "status", "state", "kind", "action"))
 
 
 def _h(s: str, n: int = 4) -> str:
@@ -107,8 +114,17 @@ class Masker:
             return [self.unmask(v) for v in obj]
         if isinstance(obj, str):
             with self._lock:
-                return self._reverse.get(obj, obj)
+                real = self._reverse.get(obj)
+            if real is None and MASKED.match(obj):
+                raise UnknownMasked(obj)  # never act on a masked address we can't map back
+            return real or obj
         return obj
+
+    def learn_addresses(self, addrs) -> None:
+        """Masks are deterministic, so the reverse map can be rebuilt from known senders after a restart."""
+        for a in addrs:
+            if a:
+                self.address(a)
 
 
 class DemoMiddleware:
@@ -132,9 +148,14 @@ class DemoMiddleware:
                     body += msg.get("body", b"")
                 if body:
                     try:
-                        body = json.dumps(self.masker.unmask(json.loads(body))).encode()
+                        data = json.loads(body)
                     except ValueError:
-                        pass
+                        data = None
+                    if data is not None:
+                        try:
+                            body = json.dumps(self.masker.unmask(data)).encode()
+                        except UnknownMasked:
+                            body = b'{"__sift_unknown_masked__": true}'  # rejected below; nothing is acted on
                 return {"type": "http.request", "body": body, "more_body": False}
             return msg
 
@@ -163,4 +184,21 @@ class DemoMiddleware:
                 return
             await send(msg)
 
-        await self.app(scope, receive_unmasked, send_masked)
+        # Peek once so an unmappable masked address is refused before the route runs.
+        first = await receive_unmasked()
+        if first.get("body") == b'{"__sift_unknown_masked__": true}':
+            body = json.dumps({"detail": "demo mode lost track of a masked sender (the backend restarted?); "
+                                         "reload the page and try again"}).encode()
+            await send({"type": "http.response.start", "status": 409,
+                        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        sent = {"done": False}
+
+        async def replay():
+            if not sent["done"]:
+                sent["done"] = True
+                return first
+            return await receive()
+
+        await self.app(scope, replay, send_masked)

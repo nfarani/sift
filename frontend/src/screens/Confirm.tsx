@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { api, Plan, Run, Status } from "../api";
+import { api, Plan, Recommendation, Run, Status } from "../api";
+import { usePoll } from "../hooks";
 import { ageLabel, day, n, plural } from "../format";
 import { Selection } from "../selection";
 
@@ -12,6 +13,13 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
   const [rebuild, setRebuild] = useState(0);
+  // Titles for the per-recommendation table (the plan itself only carries ids).
+  const { data: recs } = usePoll(() => api.get<{ items: Recommendation[] }>("/recommendations"), null);
+  // Category label, not the title: titles say "Archive …" even when you switched the action to Trash.
+  const titleOf = (id: string) => {
+    const r = recs?.items.find((x) => x.id === id);
+    return r ? (r.source === "query" ? r.title : r.category_label) : id.replace("_", " ");
+  };
 
   const items = Object.entries(selection)
     .filter(([, c]) => c.selected)
@@ -90,8 +98,8 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
           <tbody>
             {plan.summary.items.map((it) => (
               <tr key={it.rec_id}>
-                <td>{it.rec_id.replace("_", " ")}</td>
-                <td>{ACTION_LABEL[it.action]}</td>
+                <td>{titleOf(it.rec_id)}</td>
+                <td>{it.action === "trash" ? <span className="tag tag-warn">{ACTION_LABEL.trash}</span> : ACTION_LABEL[it.action] ?? it.action}</td>
                 <td>{ageLabel(it.older_than_days)}</td>
                 <td className="num"><strong>{n(it.count)}</strong></td>
                 <td className="num keep">{n(it.protected_excluded)}</td>
@@ -100,6 +108,17 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
               </tr>
             ))}
           </tbody>
+          {plan.summary.items.length > 1 && (
+            <tfoot>
+              <tr>
+                <td colSpan={3}>All {n(plan.summary.items.length)} recommendations</td>
+                <td className="num"><strong>{n(plan.total)}</strong></td>
+                <td className="num keep">{n(plan.summary.protected_excluded)}</td>
+                <td className="num">{n(plan.summary.user_excluded)}</td>
+                <td className="num">{n(plan.summary.too_recent)}</td>
+              </tr>
+            </tfoot>
+          )}
         </table>
 
         <div className="protection-summary">
@@ -135,8 +154,15 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
       )}
       {hasTrash && (
         <div className="notice notice-warn">
-          <strong>Trash is not forever.</strong> Gmail empties Trash automatically after about 30 days. Restore is only possible within that window.
+          <strong>Trash is not forever.</strong> {n(plan.summary.by_action.trash ?? 0)} {(plan.summary.by_action.trash ?? 0) === 1 ? "message goes" : "messages go"} to Trash.
+          Gmail empties Trash automatically after about 30 days. Restore is only possible within that window.
           Sift never empties Trash and never deletes permanently.
+        </div>
+      )}
+      {!locked && plan.total > 500 && (
+        <div className="notice">
+          <strong>Large run.</strong> Sift works through the {n(plan.total)} messages in batches of up to 500, re-checking each batch first.
+          You can watch progress and cancel at any time: messages not reached stay untouched, and changed ones keep their label and can be restored.
         </div>
       )}
       <div className="notice">

@@ -6,12 +6,21 @@ export function usePoll<T>(fn: () => Promise<T>, intervalMs: number | null, deps
   const [error, setError] = useState<string | null>(null);
   const fnRef = useRef(fn);
   fnRef.current = fn;
+  // Responses can arrive out of order. Never let an older request overwrite a newer one: after
+  // demo mode is toggled, a slow pre-toggle response would otherwise put unmasked data back on screen.
+  const issued = useRef(0);
+  const applied = useRef(0);
 
   const reload = useCallback(async () => {
+    const id = ++issued.current;
     try {
-      setData(await fnRef.current());
+      const d = await fnRef.current();
+      if (id < applied.current) return;
+      applied.current = id;
+      setData(d);
       setError(null);
     } catch (e) {
+      if (id < applied.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
