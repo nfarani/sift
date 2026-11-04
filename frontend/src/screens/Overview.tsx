@@ -15,7 +15,7 @@ export default function Overview({ go }: { go: (r: string) => void }) {
       <section className="empty-hero">
         <h1>Let's see what's in your inbox.</h1>
         <p>
-          Sift reads message headers only (sender, subject, labels, dates). It never opens bodies or attachments,
+          Sift reads message headers (sender, subject, labels, dates) and Gmail's short preview snippet. It never downloads full bodies or attachments,
           never marks anything as read, and changes nothing until you approve an exact plan.
         </p>
         {d.synthetic

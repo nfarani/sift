@@ -1,6 +1,6 @@
 # Connecting Gmail (read-only)
 
-This takes about 10 minutes, once. You create a private Google Cloud app that only you can use. Sift then asks it for **read-only** Gmail access (`gmail.readonly`). With that scope Sift can read headers and labels. It cannot change, delete or send anything.
+This takes about 10 minutes, once. You create a private Google Cloud app that only you can use. Sift then asks it for **read-only** Gmail access (`gmail.readonly`). With that scope Sift reads headers, labels and Gmail's short preview snippet (about 200 characters); never full bodies or attachments. It cannot change, delete or send anything.
 
 Console wording was checked against Google's docs on 2026-11-03. Google renames these pages from time to time, so if a label differs, look for the closest match.
 

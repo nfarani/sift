@@ -1,16 +1,13 @@
 # PROGRESS
 
 ## Current phase
-Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
-1. Safety review of Phase 2: first pass BLOCKING (quota limiter hang, OAuth code in log), fixed. Re-check: SAFE TO CONNECT (read-only); its 4 follow-ups fixed too (113 pass).
-2. Nick: Google Cloud setup per docs/google-setup.md.
-3. Then: 500-message test scan, full read-only scan with timing and error counts, /gate.
+Phase 2 gate **PASSED** on 2026-11-04. Next: `/phase-3` (waits for Nick).
 
 ## Phase status
 | Phase | Status | Gate |
 |---|---|---|
 | 1. Mock end-to-end | done | PASSED 2026-11-03 (83/83 tests, safety re-audit: SAFE TO PROCEED) |
-| 2. Read-only Gmail | in progress | — |
+| 2. Read-only Gmail | done | PASSED 2026-11-04 (113/113 tests; safety audit SAFE TO PROCEED; 500-message and full scans on Nick's account) |
 | 3. Claude classification + NL | not started | — |
 | 4. First real modifications | not started | — |
 | 5. Full run, polish, demo | not started | — |
@@ -34,7 +31,26 @@ Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
 - Local-only API: Host allowlist; X-Sift header + Origin check on state changes. `test_api.py::test_cross_site_and_rebinding_requests_rejected`, manual curl probes return 403.
 - UI: overview, scan (live state, cancel, resume), recommendations (filters by category/action/sender/age, per-sender exclusions, always-protect, examples, protected exceptions), confirmation (exact counts, protection exclusions, cap and Trash warnings), run progress, results (before/after, attempted vs confirmed), restore, unlock, run history. Manual click-through in headless Chrome: scan → select → exclude sender → confirm → 50-message run → restore → unlock → remaining 15,411 run.
 
+## Done (Phase 2)
+- GmailReader with `gmail.readonly` only. Tokens with extra scopes are refused and revoked. Metadata/minimal reads only. Batches of at most 50. Quota limiter: 5,400 units/min, 600 burst. Rate-limited sub-requests retried alone. `test_gmail.py`.
+- OAuth: loopback 127.0.0.1, random port, PKCE. Token in macOS Keychain (`sift-gmail`). OAuth library logs silenced. Reconnect hygiene (wipe on account change, revoke on account switch only). Expired sign-in → "Reconnect".
+- Read/write split: no MailWriter exists in Gmail mode. Executor and Restore refuse.
+- Disconnect: revokes at Google, deletes the Keychain token, wipes scanned metadata, keeps the audit log.
+- Separate DBs: `data/sift.sqlite` (synthetic), `data/sift-gmail.sqlite` (real). `data/` is 0700 with files 0600 (start.sh umask).
+- Capped test scans; measured throughput and ETA; label-name protection rules; Cc/Bcc count as people you've emailed.
+- `docs/google-setup.md` (Portuguese console users: append `?hl=en`).
+- Live results on Nick's account:
+  - 500-message test scan: 1,000 messages (500 Inbox + 500 Sent) in 4m00s, 0 errors.
+  - Full read-only scan: 98,981 messages (97,517 Inbox + 1,464 Sent) in 6h16m (4.4 msg/s), 0 errors, 2,940 senders, 5,200 protected.
+  - Rules-only classification leaves 50,296 in "Needs your review".
+
 ## Next
+- `/phase-3`: Claude classification for the ~50k unsettled messages / ~2,900 senders. Estimate tokens and cost first and wait for Nick's OK.
+- Known rules-only misfiles to check in Phase 3:
+  - Guardian Jobs → employment (should be job alerts).
+  - LinkedIn Job Alerts, Feedspot, recruit.net → review.
+  - Revolut and Uber → notifications (should be finance/receipts, though their transactional mail is protected individually).
+  - ChatGPT and Jobscan → job alerts.
 - Nick: click through http://127.0.0.1:5173 (`./start.sh`) to confirm the gate's manual check.
 - `/phase-2`: GmailProvider (read-only). Must do first: S1, S6 below.
 
@@ -44,6 +60,8 @@ Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
 - S6: label rules now resolve names to label IDs; Cc/Bcc recipients now count as people you've emailed.
 
 **Must fix before Phase 3**
+- Snippets (up to 200 chars of body preview) will go to Anthropic. Keep minimal, show in UI. Disclosure copy now says so (fixed 2026-11-04).
+- Map connection errors to fixed messages instead of raw `str(e)` in /api/status (precaution).
 - S7: classifier output is coerced to `uncertain` on unknown categories. It needs strict schema validation that rejects, plus confidence bounds.
 
 **Must fix before Phase 4 (first real modification)**, from the safety re-audit, most severe first:
@@ -57,6 +75,9 @@ Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
 8. (P4-c) Once gmail.modify is granted, the reader's token can modify too. Use a separate writer token, or record this as an accepted deviation; re-check scopes after refresh.
 9. (P4-d) Label rules resolve through labels.map from the last scan (can be stale); nested labels ("Work/Clients") aren't matched by "Work".
 10. (P4-e) Check that disconnect can't fail midway once runs exist (it currently wipes plans).
+11. Executor.run()/restore() should call `_require_writer()` themselves (defence in depth).
+12. Disconnect/startup should survive a corrupt Keychain entry (load raises before delete).
+13. Exact RFC 8058 parsing for one-click unsubscribe before building unsubscribe.
 Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_test_scan_cannot_drive_cleanup`).
 
 **Other**

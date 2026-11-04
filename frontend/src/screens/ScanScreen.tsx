@@ -54,7 +54,7 @@ export default function ScanScreen({ go, synthetic }: { go: (r: string) => void;
       <div className="page-head">
         <div>
           <h1>{running ? "Scanning…" : scan.status === "completed" ? "Scan complete" : `Scan ${scan.status}`}</h1>
-          <p className="muted">Read-only. Headers and labels only; nothing is marked as read.</p>
+          <p className="muted">Read-only. Headers, labels and Gmail's short preview snippet only; nothing is marked as read.</p>
         </div>
         <div className="row">
           {running && <button className="btn btn-ghost" onClick={() => act("/scan/cancel")}>Cancel</button>}

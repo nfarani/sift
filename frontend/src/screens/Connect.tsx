@@ -16,10 +16,10 @@ export default function Connect({ status, onChange }: { status: Status; onChange
       {st === "reauth_required" ? (
         <p>Google ended Sift's sign-in. While the Google Cloud app is in Testing mode, sign-ins expire after 7 days. Reconnecting takes a few seconds.</p>
       ) : (
-        <p>Sift asks Google for <strong>read-only</strong> access (<code>gmail.readonly</code>). It can read headers and labels to analyse your inbox, and it cannot change, delete or send anything.</p>
+        <p>Sift asks Google for <strong>read-only</strong> access (<code>gmail.readonly</code>). It reads headers, labels and Gmail's short preview snippet to analyse your inbox, and it cannot change, delete or send anything.</p>
       )}
       <ul className="connect-points">
-        <li>Bodies and attachments are never downloaded.</li>
+        <li>Full message bodies and attachments are never downloaded; only Gmail’s ~200-character preview snippet.</li>
         <li>Nothing is marked as read.</li>
         <li>Your sign-in token is kept in the macOS Keychain.</li>
         <li>Disconnect anytime from Account.</li>

@@ -94,7 +94,11 @@ for p in "$API_PORT" "$UI_PORT"; do
 done
 
 # --- start ---------------------------------------------------------------------
+# Local data (scanned metadata, logs) is private to your user account.
+umask 077
 mkdir -p data
+chmod 700 data
+find data -type f -exec chmod 600 {} + 2>/dev/null || true
 LOG_DIR="$ROOT/data/logs"; mkdir -p "$LOG_DIR"
 PIDS=()
 cleanup() {
