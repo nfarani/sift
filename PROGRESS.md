@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Current phase
-Phase 4 gate: all checks met except Nick's look in Gmail (2026-11-04). Then `/phase-5` (waits for Nick).
+Phase 4 gate **PASSED** on 2026-11-04. Next: `/phase-5` (waits for Nick).
 
 ## Phase status
 | Phase | Status | Gate |
@@ -9,7 +9,7 @@ Phase 4 gate: all checks met except Nick's look in Gmail (2026-11-04). Then `/ph
 | 1. Mock end-to-end | done | PASSED 2026-11-03 (83/83 tests, safety re-audit: SAFE TO PROCEED) |
 | 2. Read-only Gmail | done | PASSED 2026-11-04 (113/113 tests; safety audit SAFE TO PROCEED; 500-message and full scans on Nick's account) |
 | 3. Claude classification + NL | done | PASSED 2026-11-04 (189/189 tests; safety audit BLOCKING → fixed in e00d2b8 → re-check SAFE TO PROCEED; live run on Nick's account, 20-sender spot-check OK) |
-| 4. First real modifications | done | 2026-11-04: 322/322 tests; safety audit SAFE TO PROCEED (3 FAILs fixed in 8c26df5, re-checked); live 50-message run + restore 50/50 confirmed by re-read and DB audit; NEEDS NICK: visual check in Gmail |
+| 4. First real modifications | done | 2026-11-04: 322/322 tests; safety audit SAFE TO PROCEED (3 FAILs fixed in 8c26df5, re-checked); live 50-message run + restore 50/50 confirmed by re-read and DB audit; Nick checked Gmail: label search returns nothing after restore |
 | 5. Full run, polish, demo | not started | — |
 
 ## Done (Phase 1, each verified by a test or a manual check)
@@ -90,7 +90,7 @@ Phase 4 gate: all checks met except Nick's look in Gmail (2026-11-04). Then `/ph
   - Safety check of the live DB: same 50 ids, all in the plan, none protected, no UNREAD or Trash changes.
 
 ## Next
-- Nick: confirm in Gmail that the label `Sift/2026-11-04-run-1` is empty and the 50 messages are back in the Inbox; click "Unlock full runs".
+- Nick: click "Unlock full runs" (backend allows it: run 1 fully restored).
 - `/phase-5`: full run, polish, demo mode (build PII masking before recording anything for publishing).
 - Ask Nick before the first real unsubscribe batch.
 
