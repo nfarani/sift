@@ -75,3 +75,23 @@ def test_protected_messages_never_enter_a_plan(db, scanned):
             n = c.execute("SELECT COUNT(*) FROM plan_messages pm JOIN messages m ON m.id=pm.message_id "
                           "WHERE pm.plan_id=? AND m.protected=1", (p["id"],)).fetchone()[0]
         assert n == 0
+
+
+@pytest.mark.parametrize("subject", [
+    "Your Sunday morning trip with Uber", "Your Friday evening order with Uber Eats",
+    "Sua viagem de domingo de manhã com a Uber", "Seu pedido de sexta-feira à noite com o Uber Eats",
+    "Seu recibo da Uber", "Sua fatura chegou", "Comprovante de pagamento", "Pedido nº 4411 confirmado",
+    "Sua reserva está confirmada", "Seu cartão de embarque", "Redefinição de senha",
+    "Seu código de verificação é 123456", "Alerta de segurança: novo acesso", "Seu extrato de outubro",
+    "⚠️ Important information regarding your account",
+])
+def test_trip_receipts_and_portuguese_transactional_subjects(subject):
+    assert reason(subject=subject) is not None
+
+
+@pytest.mark.parametrize("subject", [
+    "Get 20% off your next 3 orders", "Niccolas, tem uma promoção esperando por você 🎉",
+    "Stay prepared with your rides and get 20% off", "Ofertas imperdíveis desta semana", "Novidades da semana",
+])
+def test_promos_from_receipt_senders_stay_unprotected(subject):
+    assert reason(subject=subject) is None

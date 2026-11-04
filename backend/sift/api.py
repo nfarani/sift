@@ -24,6 +24,7 @@ from .providers.base import MailReader, MailWriter, ProviderError
 from .providers.gmail_auth import (AuthError, ReauthRequired, TokenStore, check_scopes, credential_store_name,
                                    revoke, run_consent_flow)
 from .providers.mock import MockProvider
+from .protection import RULES_VERSION
 from .ai import run as ai_run
 from .ai.ledger import Ledger, SpendCapReached
 from .ai.planner import PlannerError, QueryPlanner
@@ -731,6 +732,18 @@ def create_app(state: State) -> FastAPI:
         state.provider.regenerate(state.settings.mock_size, state.settings.mock_seed)
         db.wipe_analysis()
         return {"ok": True}
+
+    # Protection flags are stored with the scan; re-derive them if the built-in rules changed since.
+    if db.get_setting("protection.rules_version") != RULES_VERSION and not state.jobs.busy():
+        with db.connect() as c:
+            has_scan = c.execute("SELECT 1 FROM messages LIMIT 1").fetchone() is not None
+        if has_scan and account():
+            try:
+                _reanalyse()  # apply_protection records the rules version
+            except ProviderError as e:
+                log.warning("protection refresh postponed: %s", type(e).__name__)
+        elif not has_scan:
+            db.set_setting("protection.rules_version", RULES_VERSION)
 
     return app
 

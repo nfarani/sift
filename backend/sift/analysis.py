@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 
 from .classifier.base import CATEGORIES, DISPOSABLE, KEEP, Classifier, SenderGroup
 from .db import Database, now_iso
-from .protection import load_context, protection_reason
+from .protection import RULES_VERSION, load_context, protection_reason
 
 # Default age threshold per recommendation: recent mail is left alone.
 DEFAULT_OLDER_THAN = {"job_alerts": 14, "promotions": 30, "newsletters": 30, "social": 7,
@@ -34,6 +34,7 @@ def apply_protection(db: Database, user_email: str) -> int:
             updates.append((1 if reason else 0, reason, r["id"]))
     with db.tx() as c:
         c.executemany("UPDATE messages SET protected=?, protect_reason=? WHERE id=?", updates)
+    db.set_setting("protection.rules_version", RULES_VERSION)
     return sum(u[0] for u in updates)
 
 

@@ -20,11 +20,25 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
                             r"new\s+sign-?in|login\s+attempt|account\s+recovery)\b", re.I)),
     ("finance", re.compile(r"\b(bank|statement|payment\s+received|direct\s+debit|payslip|tax|your\s+bill|"
                            r"account\s+ending|transaction)\b", re.I)),
+    # Trip/order receipts phrased without the word "receipt" ("Your Sunday evening order with Uber Eats").
+    ("receipt", re.compile(r"\byour\s+(\w+\s+){0,3}(trip|ride|order|delivery)\s+with\b", re.I)),
+    ("security", re.compile(r"\bimportant\s+information\s+regarding\s+your\s+account\b", re.I)),
+    # Portuguese equivalents.
+    ("receipt", re.compile(r"\b(recibos?|fatura|nota\s+fiscal|comprovante|reembolso|pedido\s+(confirmado|n[ºo°.])|"
+                           r"(sua|seu)\s+(viagem|corrida|pedido|entrega)\b.{0,40}\bcom\s+(a|o)\b)", re.I)),
+    ("travel", re.compile(r"\b(reserva|cart[ãa]o\s+de\s+embarque|itiner[áa]rio|check-?in)\b", re.I)),
+    ("security", re.compile(r"\b(senha|c[óo]digo\s+de\s+(verifica[çc][ãa]o|seguran[çc]a|acesso)|alerta\s+de\s+seguran[çc]a|"
+                            r"novo\s+(acesso|login))\b", re.I)),
+    ("finance", re.compile(r"\b(extrato|transfer[êe]ncia|pagamento\s+(recebido|confirmado|aprovado)|boleto)\b", re.I)),
 ]
 _SENDER_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("security", re.compile(r"^(security|account-?security|verify|2fa)@", re.I)),
     ("finance", re.compile(r"^(statements?|billing|invoices?|payments?)@", re.I)),
 ]
+
+# Changes whenever the built-in patterns change, so stored protection flags can be re-derived at startup.
+RULES_VERSION = __import__("hashlib").sha256(
+    repr([(k, p.pattern) for k, p in _PATTERNS + _SENDER_PATTERNS]).encode()).hexdigest()[:16]
 
 
 @dataclass

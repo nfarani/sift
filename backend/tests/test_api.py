@@ -133,3 +133,19 @@ def test_execute_refused_while_scan_incomplete(client):
     wait(c, "/api/scan")
     r = c.post(f"/api/plans/{plan['id']}/execute")
     assert r.status_code == 400 and "scan" in r.json()["detail"]
+
+
+def test_startup_reapplies_protection_when_builtin_rules_changed(tmp_path, provider, retry):
+    """Stored protection flags come from the rules at scan time; a newer rule set re-derives them at startup."""
+    c, state = client.__wrapped__(tmp_path, provider, retry)
+    assert c.post("/api/scan").status_code == 200
+    wait(c, "/api/scan")
+    db = state.db
+    with db.connect() as x:
+        mid = x.execute("SELECT id FROM messages WHERE protected=1 AND is_sent=0 LIMIT 1").fetchone()[0]
+        x.execute("UPDATE messages SET protected=0, protect_reason=NULL WHERE id=?", (mid,))  # stale flag
+    db.set_setting("protection.rules_version", "old")
+    s = Settings(); s.data_dir = tmp_path; s.extra_allowed_hosts = ("testserver",)
+    create_app(build_state(s, provider=provider, retry=retry))
+    with db.connect() as x:
+        assert x.execute("SELECT protected FROM messages WHERE id=?", (mid,)).fetchone()[0] == 1
