@@ -119,3 +119,15 @@ def test_colliding_masks_are_never_unmasked():
     m._ambiguous.add(a)  # simulate a collision
     with pytest.raises(UnknownMasked):
         m.unmask({"excluded_senders": [a]})
+
+
+def test_masks_with_digit_heavy_hashes_round_trip():
+    """A mask whose hash has 6+ digits must not be mangled by the digit rule (it would break unmasking)."""
+    from sift.demo import MASKED, Masker
+    m = Masker()
+    for i in range(3000):
+        addr = f"user{i}@shop.example"
+        masked = m.text(addr)
+        assert MASKED.match(masked) and "#" not in masked, masked
+        assert m.unmask(masked) == addr
+    assert m.text("order 12345678 for a@b.example") .startswith("order #### for a***")

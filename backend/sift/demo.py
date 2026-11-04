@@ -86,7 +86,14 @@ class Masker:
         return f"Sender #{int(_h(n, 6), 16) % 9000 + 1000}"
 
     def text(self, s: str) -> str:
-        s = EMAIL.sub(lambda m: self.address(m.group(0)), s)
+        # Mask addresses first, and keep the digit rule away from them: a mask's hash can contain 6+ digits.
+        parts, last = [], 0
+        for m in EMAIL.finditer(s):
+            parts.append(DIGITS.sub("####", s[last:m.start()]))
+            parts.append(self.address(m.group(0)))
+            last = m.end()
+        parts.append(DIGITS.sub("####", s[last:]))
+        s = "".join(parts)
         with self._lock:
             names = sorted(self._names.items(), key=lambda kv: -len(kv[0]))
             own = set(self._own_tokens)
@@ -95,7 +102,7 @@ class Masker:
                 s = re.sub(re.escape(real), pseudo, s, flags=re.I)
         for t in own:
             s = re.sub(rf"\b{re.escape(t)}\b", "You", s, flags=re.I)
-        return DIGITS.sub("####", s)
+        return s
 
     # -- JSON walk ----------------------------------------------------------
     def mask(self, obj, key: str | None = None):
