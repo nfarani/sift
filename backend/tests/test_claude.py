@@ -431,3 +431,20 @@ def test_review_suggestion_saved_as_review(ai_app):
     rid = c.post("/api/query/save", json={"spec": {**SPEC, "suggested_action": "review"}}).json()["id"]
     r = c.post("/api/plans", json={"items": [{"rec_id": rid}]})
     assert r.status_code == 400 and "review-only" in r.json()["detail"]
+
+
+
+def test_bad_key_stops_run_at_first_batch(db, scanned):
+    import anthropic, httpx2
+    def respond(kw):
+        raise anthropic.AuthenticationError("bad key", response=httpx2.Response(401, request=httpx2.Request("POST", "https://x")), body=None)
+    clf, client = make(db, respond)
+    status = ai_run.run(db, clf, _new_run(db), "you@sift-demo.test")
+    assert status == "failed" and len(client.calls) == 1
+    with db.connect() as c:
+        assert "ANTHROPIC_API_KEY" in c.execute("SELECT error FROM ai_runs").fetchone()[0]
+
+
+def test_short_sender_fragment_rejected():
+    with pytest.raises(SpecError):
+        parse_spec({**SPEC, "categories": [], "subject_excludes_any": [], "sender_contains": ["co"]})

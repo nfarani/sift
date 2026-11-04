@@ -73,7 +73,8 @@ def parse_spec(d: dict) -> Spec:
     s.categories = _strs(d.get("categories", []), "categories", 3, 20, 15)
     if any(c not in CATEGORIES for c in s.categories):
         raise SpecError("unknown category")
-    s.sender_contains = [x.lower() for x in _strs(d.get("sender_contains", []), "sender_contains")]
+    # >= 4 characters: fragments like "co" or "@g" would match most of an inbox.
+    s.sender_contains = [x.lower() for x in _strs(d.get("sender_contains", []), "sender_contains", 4)]
     s.subject_contains_any = _strs(d.get("subject_contains_any", []), "subject_contains_any")
     s.subject_excludes_any = _strs(d.get("subject_excludes_any", []), "subject_excludes_any")
     s.older_than_days = _days(d.get("older_than_days"), "older_than_days")

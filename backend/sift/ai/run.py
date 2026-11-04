@@ -96,7 +96,12 @@ def run(db: Database, clf: ClaudeClassifier, run_id: int, user_email: str) -> st
     rules = RuleOnlyClassifier()
     classify(db, rules, aggregate(db, user_email))
     build_recommendations(db, rules, None)
-    status = ("cancelled" if stats["cancelled"] else "stopped_at_cap" if stats["stopped_at_cap"] else "completed")
+    if stats["fatal"] or (groups and not labels and stats["failed"]):
+        status = "failed"
+    else:
+        status = ("cancelled" if stats["cancelled"] else "stopped_at_cap" if stats["stopped_at_cap"] else "completed")
+    if stats["fatal"]:
+        stats["errors"].insert(0, stats["fatal"])
     with db.connect() as c:
         c.execute("UPDATE ai_runs SET status=?, finished_at=?, groups_done=?, groups_failed=?, groups_reviewed=?, "
                   "cost_usd=?, current_op='finished', error=? WHERE id=?",

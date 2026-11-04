@@ -17,7 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ..ai.ledger import Ledger, SpendCapReached, cost, estimate_tokens
+from ..ai.ledger import MOST_EXPENSIVE, Ledger, SpendCapReached, cost, estimate_tokens
 from .base import CATEGORIES, KEEP
 
 log = logging.getLogger("sift.claude")
@@ -88,6 +88,9 @@ RESULT_SCHEMA = {
     "required": ["results"],
     "additionalProperties": False,
 }
+
+
+FATAL_API_ERRORS = {"AuthenticationError", "PermissionDeniedError", "NotFoundError", "BadRequestError"}
 
 
 class InvalidOutput(ValueError):
@@ -208,7 +211,9 @@ class ClaudeClassifier:
         est_in = estimate_tokens(SYSTEM_PROMPT) + 400 + estimate_tokens(render_data(groups))
         max_tokens = 8000 if model == self.review_model else 4096
         # Reserve the worst case (every output token used) so one request can never overshoot the cap.
-        self.ledger.check(run_id, cost(model, est_in, max_tokens))  # raises SpendCapReached
+        # With server-side fallbacks the request may be served by a pricier model: reserve at the dearest price.
+        priced = MOST_EXPENSIVE if model.startswith("claude-opus-5") else model
+        self.ledger.check(run_id, cost(priced, est_in, max_tokens))  # raises SpendCapReached
         kwargs = dict(model=model, max_tokens=max_tokens,
                       system=SYSTEM_PROMPT, messages=[{"role": "user", "content": render_data(groups)}],
                       output_config={"format": {"type": "json_schema", "schema": RESULT_SCHEMA}})
@@ -244,7 +249,7 @@ class ClaudeClassifier:
         they keep their rules label. Raises nothing for invalid output; SpendCapReached stops the run."""
         out: dict[str, Label] = {}
         stats = {"failed": 0, "review_failed": 0, "reviewed": 0, "stopped_at_cap": False, "cancelled": False,
-                 "errors": []}
+                 "errors": [], "fatal": None}
 
         def run_pass(model, gs, batch, purpose):
             for i in range(0, len(gs), batch):
@@ -268,6 +273,10 @@ class ClaudeClassifier:
                     if type(e).__module__.split(".")[0] != "anthropic":
                         raise
                     log.warning("%s batch failed: %s", purpose, type(e).__name__)
+                    if type(e).__name__ in FATAL_API_ERRORS:  # bad key, model or request: every batch would fail
+                        stats["fatal"] = f"{type(e).__name__}: check ANTHROPIC_API_KEY and the model names in .env"
+                        stats["errors"].append(type(e).__name__)
+                        return
                     stats[key] += len(part)
                     stats["errors"].append(f"{type(e).__name__}")
                     continue
@@ -277,7 +286,7 @@ class ClaudeClassifier:
                     on_batch(labs)
 
         run_pass(self.bulk_model, groups, self.bulk_batch, "classify_bulk")
-        if stats["stopped_at_cap"] or stats["cancelled"]:
+        if stats["stopped_at_cap"] or stats["cancelled"] or stats["fatal"]:
             return out, stats
         low = [g for g in groups if g.sender in out and out[g.sender].confidence < self.review_threshold]
         before = dict(out)
