@@ -1,106 +1,138 @@
-# Sift: build kit
+# Sift
 
-This is a Claude Code project kit. It builds **Sift**, a local AI inbox cleaner for Gmail, in five gated phases. You run everything from your terminal. Once the app is built, it lives in this same folder, so you can keep working on it here.
+Sift is a local, terminal-launched app that cleans up a Gmail inbox you can no longer manage by hand. It scans
+message metadata, protects anything that looks like real correspondence or a record you'd need, uses Claude to
+classify the bulk senders that rules can't settle, and proposes explainable cleanup plans. It changes mail only
+after you approve a frozen plan, and every change is labelled and reversible.
+
+It runs on your Mac and talks only to Google (Gmail API) and Anthropic (classification). There is no server.
+
+How it's built: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Progress and known gaps: [PROGRESS.md](PROGRESS.md).
 
 ## Requirements
-- macOS, with Python 3.12+, Node 20+ and git
-- [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) installed (`claude --version`)
-- An Anthropic API key, from Phase 3 onwards, for the app's AI classification. Phases 1 and 2 spend no API money.
+- macOS, with Python 3.12+, Node 20.19+ and git
+- A Google Cloud OAuth client for Gmail (setup: [docs/google-setup.md](docs/google-setup.md))
+- An Anthropic API key for classification (optional: without it Sift runs rules-only and says so)
 
-## Start
+## Run it
 ```bash
-unzip sift-agent.zip && cd sift-agent
-./kickoff.sh          # git init + launches Claude Code on Phase 1
+cp .env.example .env      # add ANTHROPIC_API_KEY, optionally SIFT_AI_SPEND_CAP_USD (per Claude run)
+./start.sh --gmail        # your Gmail; ./start.sh alone uses a synthetic mailbox
 ```
-Or do it manually: `git init`, then run `claude` and type `/phase-1`.
+`./start.sh` checks dependencies, starts the API (127.0.0.1:8765) and the UI (127.0.0.1:5173) and opens the browser.
+`SIFT_NO_OPEN=1` skips the browser. Logs are in `data/logs/`. Ctrl-C stops both. Set `SIFT_PROVIDER=gmail` in
+`.env` to make Gmail the default. The synthetic mailbox and Gmail never share a database.
 
-## Running the app
-```bash
-./start.sh            # checks deps + .env, starts API (127.0.0.1:8765) and UI (127.0.0.1:5173), opens the browser
-```
-`SIFT_NO_OPEN=1 ./start.sh` skips opening the browser. Logs are in `data/logs/`. Ctrl-C stops both servers.
+## Using it
+1. **Connect Gmail** (read-only, `gmail.readonly`). Scanning reads metadata only and never marks anything read.
+2. **Scan.** Paginated, checkpointed, resumable. About 4–5 messages a second on a personal account
+   (Nick's 99k messages took about 6 hours).
+3. **Classify with Claude** (optional). Sift shows the token and dollar estimate first and spends nothing until you
+   approve it. Each run has a hard cap (`SIFT_AI_SPEND_CAP_USD`, default $2). Only unsettled sender groups are sent:
+   sender, list id, counts, up to 6 subjects and 3 short previews per sender, never bodies or attachments, never
+   protected mail.
+4. **Review recommendations.** Each one shows why, which senders, examples, and how many protected messages it
+   leaves out. Exclude senders, set an age cutoff, or ask in plain English ("old shopping promos but keep receipts");
+   Claude turns that into a filter you can see and edit. It never creates or approves a plan.
+5. **Enable cleanup.** A second, separate Google consent (`gmail.modify`). It changes nothing by itself.
+6. **Approve a plan.** The exact message ids are frozen at approval. The first run is capped at 50 messages from one
+   recommendation; you restore it to prove recovery works before full runs unlock.
+7. **Run, watch, cancel, restore.** Live progress, cancel at any time, and a before/after report.
 
-`./start.sh --gmail` connects your real Gmail **read-only** (setup: `docs/google-setup.md`); `./start.sh --mock` or the default uses the synthetic mailbox. The two never share a database.
+## What Sift will and won't do
+- **Default action is archive + label** (`Sift/2026-11-04-run-12`): fully reversible. Trash is optional and the
+  confirmation says Gmail empties Trash after about 30 days, so restore is only guaranteed within that window.
+- **Never:** permanent delete, emptying Trash, sending, replying, forwarding, drafts, following links, opening
+  attachments.
+- **Protection runs first and wins:** starred mail, threads you replied to, senders you've emailed, receipts, orders,
+  bookings, travel, security and 2FA, bank and finance mail (English and Portuguese patterns), and your own rules.
+  Claude's output can't unprotect anything.
+- **Revalidation at run time:** every message is re-read just before it changes, and dropped if it's gone, moved,
+  newly protected (including mail you sent since the scan) or no longer matches. Revalidation can remove ids from a
+  plan, never add.
+- **Audit log:** append-only, one row before each change (write-ahead) and one after it's confirmed by re-reading.
+  The UI always shows "attempted" and "confirmed" separately.
+- **Unsubscribe** is separate: RFC 8058 one-click only, its own approval per batch, a single HTTPS POST per sender
+  with no redirects, logged with the host and status. `mailto:` unsubscribes are listed as manual and never sent.
+  Senders you've emailed or that have protected mail are skipped.
+- **Prompt injection:** email content is untrusted data, wrapped in an escaped block, and Claude has no tools. Its
+  output is validated against a strict schema; anything else is rejected and the sender keeps its rules label.
 
 ### Gmail scopes and tokens
 | Token (macOS Keychain service) | Scope | Created when | Used by |
 |---|---|---|---|
 | `sift-gmail` | `gmail.readonly` | **Connect Gmail** | scanner, analysis, executor revalidation |
-| `sift-gmail-writer` | `gmail.modify` (+ `gmail.readonly`) | **Enable cleanup**, a separate consent you trigger | the executor only |
+| `sift-gmail-writer` | `gmail.modify` (+ `gmail.readonly`) | **Enable cleanup** | the executor only |
 
-- Sift never requests the full-access Gmail scope or any send/compose scope. A token carrying anything else is refused and revoked. Scopes are re-checked after every token refresh.
-- `gmail.modify` lets Sift archive, label and move to Trash. It can't permanently delete. Google's consent screen describes it as "Read, compose, and send emails". Sift has no code that sends or drafts mail, and the guardrail hook blocks adding any.
-- Enabling cleanup changes nothing by itself. Every change still needs an approved plan, and plans approved before cleanup was enabled have to be approved again.
-- **Disable cleanup** revokes and deletes only the writer token. Google ties both Sift tokens to one grant, so revoking may end the read-only sign-in too. If that happens, Sift shows **Reconnect Gmail**.
-- **Testing mode:** Google expires refresh tokens after 7 days. When the read-only token expires, Sift shows **Reconnect Gmail**. When the cleanup token expires, it shows **Reconnect cleanup**. Neither crashes the app.
-- An unreadable Keychain entry is treated as missing: Sift deletes it and tells you.
-- **Unsubscribe** needs cleanup enabled plus its own approval for each batch. Only RFC 8058 one-click is used: a single HTTPS POST, no redirects followed, no cookies, and nothing sent to private or local addresses. `mailto:` unsubscribes are shown as manual and never sent. Every attempt is logged with the sender, URL host and status code.
+- Sift never requests the full-access Gmail scope or any send/compose scope. A token with anything else is refused
+  and revoked. Scopes are re-checked after every refresh.
+- Google's consent screen describes `gmail.modify` as "Read, compose, and send emails". Sift has no code that sends
+  or drafts mail, and the guardrail hook blocks adding any.
+- **Disable cleanup** revokes and deletes the writer token. Google ties both tokens to one grant, so this may end the
+  read-only sign-in too; Sift then shows **Reconnect Gmail**.
+- **Testing mode:** Google expires refresh tokens after 7 days. Sift shows **Reconnect Gmail** or **Reconnect
+  cleanup** instead of failing.
+- **Disconnect** revokes both tokens at Google, deletes them from the Keychain, and wipes scanned metadata, plans and
+  Claude labels. The audit log and the spend totals (tokens and dollars only) are kept.
 
-By default the app runs against a **synthetic mailbox** of ~45,000 fictional messages (`data/mock_mailbox.sqlite`),
-badged "Synthetic data" everywhere. Classification is **rules only, no AI** until Phase 3.
+## Demo mode (for screen recordings)
+Turn it on with the switch in the top bar (or `SIFT_DEMO_MODE=true`). The backend then masks every API response
+before it reaches the browser:
+- email addresses → `n***a1b2@mail.example.com` (domain kept)
+- display names → `Sender #4821`
+- subjects and previews → hidden
+- your own name and address, and digit runs of 6+ (order numbers, codes) → masked
 
-Tests: `cd backend && .venv/bin/python -m pytest` · frontend typecheck: `cd frontend && npm run typecheck`.
+Actions keep working: the backend maps masked addresses back to the real ones on requests. A badge shows demo mode
+is on. `./start.sh` also prints the masked address when demo mode is on. Google's own consent screen is outside
+Sift and is not masked.
 
-### Layout
+## Tests
+```bash
+cd backend && .venv/bin/python -m pytest      # backend
+cd frontend && npx tsc --noEmit && npx vite build
+```
+Latest results are in [PROGRESS.md](PROGRESS.md#test-results). The backend tests run offline against the synthetic
+mailbox and fake Gmail/Anthropic clients; they never read your real `.env` key.
+
+## Layout
 ```
 backend/sift/
-  providers/base.py     MailProvider interface (read methods + executor-only write methods; no delete/send)
-  providers/mock.py     MockProvider (SQLite-backed, Gmail-shaped, fault injection)
-  providers/synthetic.py  deterministic 45k fictional mailbox incl. prompt-injection subjects
+  api.py                FastAPI routes; local-only Host/Origin/X-Sift guard; demo-mode middleware
+  config.py             settings from .env
+  providers/base.py     MailReader / MailWriter interfaces (no delete, no send)
+  providers/mock.py     synthetic Gmail-shaped mailbox (providers/synthetic.py generates ~45k messages)
+  providers/gmail.py    GmailReader (gmail.readonly, metadata only, batched, quota-limited)
+  providers/gmail_writer.py  GmailWriter (label, batchModify, trash/untrash; used by the executor only)
+  providers/gmail_auth.py    OAuth loopback + PKCE, separate reader/writer Keychain tokens, scope checks
   scanner.py            metadata-only paginated scan, checkpoints, cancel/resume
   protection.py         deterministic protection rules (run before any classifier)
-  analysis.py           aggregation → protection → classification → recommendations
-  classifier/           Classifier interface + RuleOnlyClassifier
-  plans.py              frozen plans (exact ids + hash, DB triggers block changes)
+  analysis.py           aggregate by sender → protect → classify → recommendations
+  classifier/           RuleOnlyClassifier, ClaudeClassifier (strict JSON schema)
+  ai/                   spend ledger + cap, Claude run orchestration, natural-language query planner
+  query.py              the structured filter spec the planner produces
+  plans.py              frozen plans: exact ids + hash, DB triggers block changes
   executor.py           the only module that modifies mail: revalidate, batch, confirm, audit, restore
-  providers/gmail.py    GmailReader (gmail.readonly, metadata only)
-  providers/gmail_writer.py  GmailWriter (gmail.modify: label, batchModify, trash/untrash; executor only)
-  providers/gmail_auth.py    OAuth loopback flow, separate reader/writer Keychain tokens, scope checks
-  unsubscribe.py        RFC 8058 one-click parsing, frozen batches, SSRF-safe single POST, append-only log
-  api.py                FastAPI routes the UI reads from
-frontend/src/           React + TS + Vite UI
+  unsubscribe.py        RFC 8058 parsing, frozen batches, SSRF-safe POST, append-only log
+  demo.py               PII masking for demo mode
+frontend/src/           React + TypeScript + Vite
+docs/                   SPEC, PHASES, ARCHITECTURE, google-setup
 ```
 
-## Commands, from inside Claude Code
+## Building it with Claude Code
+This repo is also the kit Sift was built with, in five gated phases (`docs/PHASES.md`).
+
 | Command | What it does |
 |---|---|
 | `/phase-1` … `/phase-5` | Builds the next phase. Each phase stops at its gate. |
-| `/gate` | Runs the tests and the safety audit, updates PROGRESS.md and reports pass or fail. |
-| `/status` | Shows where things stand and what to run next. |
-| `/feature <idea>` | Adds features after the core build, within the safety rules. |
+| `/gate` | Runs the tests and the safety audit, updates PROGRESS.md, reports pass or fail. |
+| `/status` | Where things stand and what to run next. |
+| `/feature <idea>` | Adds a feature after the core build, within the safety rules. |
 
-Any phase command also accepts extra notes, for example `/phase-1 use a muted green accent`.
+`.claude/hooks/guard.py` checks every shell command and file edit Claude makes. It blocks app code that adds the
+full-access Gmail scope, send/compose scopes, permanent delete, drafts or emptying Trash, and shell commands that
+read OAuth tokens or `.env` secrets, call Gmail directly, force-push, or recursively delete your home folder. Docs
+and tests are exempt from the code scan so they can name what they forbid.
 
-## The phases
-1. **Mock end-to-end.** Builds the full app against 45,000 synthetic emails. Uses no Google account and costs nothing.
-2. **Read-only Gmail.** Claude will stop and walk you through the Google Cloud setup.
-3. **Claude classification and natural-language requests.** Claude shows you the estimated cost and waits for your OK before spending anything.
-4. **First real changes.** The first run is capped at 50 messages, and restoring them is verified before larger runs are allowed.
-5. **Full run, polish and demo mode** for the LinkedIn recording.
-
-## What's in the kit
-```
-CLAUDE.md                    standing rules: architecture, safety, Gmail facts
-docs/SPEC.md                 your original full spec
-docs/PHASES.md               the five phases with their gates
-PROGRESS.md                  living progress log (Claude updates it)
-.claude/commands/            /phase-1..5, /gate, /status, /feature
-.claude/agents/              safety-reviewer, test-runner, gmail-specialist, ui-designer
-.claude/hooks/guard.py       hard guardrail, explained below
-.claude/settings.json        permissions and hook wiring
-.env.example                 config template (copy it to .env)
-```
-
-## The guardrail hook
-Before every shell command or file edit Claude makes, `guard.py` checks it. It **blocks**:
-- App code that adds the full-access Gmail scope, send or compose scopes, permanent delete, drafts, or emptying Trash.
-- Shell commands that read OAuth tokens or `.env` secrets, call Gmail directly, force-push, or recursively delete your home folder.
-
-These rules are enforced in code, not just requested in a prompt. Docs and tests are exempt from the code scan, because they need to mention these things in order to forbid them.
-
-## Your checkpoints
-Claude will stop and ask you before it does any of these:
-- Connects your real Gmail account.
-- Spends API money above the cap in `.env`.
-- Makes the first real change to your mail.
-- Sends any unsubscribe request.
+Claude stops and asks before it connects a real account, spends above the cap, makes the first real change to your
+mail, or sends any unsubscribe request.
