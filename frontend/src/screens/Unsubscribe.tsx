@@ -135,7 +135,7 @@ function Picker({ go }: { go: (r: string) => void }) {
         )}
         <p className="muted small" style={{ marginTop: 10 }}>
           The method here is from the scan. When you build a batch, Sift re-reads each sender's newest message header (read-only) and that decides it.
-          Senders you have emailed and senders you protect are never unsubscribed.
+          Senders you have emailed, senders you protect, and senders with any protected mail (starred, your replies, receipts, security or bank mail) are never unsubscribed.
         </p>
       </section>
 
@@ -256,7 +256,7 @@ function BatchReview({ batchId, go, status }: { batchId: number; go: (r: string)
           <h2>Results</h2>
           <div className="stats stats-4" style={{ marginTop: 0 }}>
             <div className="stat stat-mini"><div className="stat-label">POSTs attempted</div><div className="stat-value">{n(attempted)}</div><div className="stat-hint">of {n(b.counts.one_click)} approved</div></div>
-            <div className="stat stat-mini stat-good"><div className="stat-label">Confirmed by sender</div><div className="stat-value">{n(byOutcome.confirmed)}</div></div>
+            <div className="stat stat-mini stat-good"><div className="stat-label">Accepted by sender (HTTP 2xx)</div><div className="stat-value">{n(byOutcome.confirmed)}</div></div>
             <div className="stat stat-mini"><div className="stat-label">Not confirmed / failed / refused</div><div className="stat-value">{n((byOutcome.not_confirmed ?? 0) + (byOutcome.failed ?? 0) + (byOutcome.refused ?? 0))}</div></div>
             <div className="stat stat-mini"><div className="stat-label">Manual, not sent</div><div className="stat-value">{n(byOutcome.manual)}</div></div>
           </div>

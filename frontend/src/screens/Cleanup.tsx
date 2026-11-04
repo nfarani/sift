@@ -149,7 +149,7 @@ export default function Cleanup({ status, onChange, go }: { status: Status | nul
         <div className="notice notice-cap" role="status">
           Cleanup disabled.{" "}
           {disabled.revoked_at_google ? "Google confirmed the revocation." : "Google didn't confirm the revocation."}{" "}
-          {disabled.local_writer_token_deleted ? "The cleanup token was deleted from this Mac." : "No local cleanup token was found."}
+          {disabled.local_writer_token_deleted ? "The cleanup token was deleted from this Mac." : <span className="bad">The cleanup token could not be deleted from this Mac. Remove the "sift-gmail-writer" item in Keychain Access.</span>}
           <div style={{ marginTop: 6 }}>{disabled.note}</div>
           {disabled.problems.map((p) => <div key={p} className="bad" style={{ marginTop: 4 }}>{p}</div>)}
         </div>
