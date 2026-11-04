@@ -451,8 +451,8 @@ def create_app(state: State) -> FastAPI:
                     raise AuthError("You approved cleanup for a different Google account than the one connected. "
                                     "Nothing was saved; enable cleanup again with the connected account.")
                 state.writer_store.save(creds)
-                state.attach(state.provider, state.make_writer(creds))
                 db.set_setting("cleanup.enabled_at", now_iso())  # plans approved before this need re-approval
+                state.attach(state.provider, state.make_writer(creds))
                 state.cleanup = {"state": "enabled", "error": None}
             except Exception as e:  # message only, never tokens
                 log.warning("enable cleanup failed: %s", type(e).__name__)

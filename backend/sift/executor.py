@@ -41,9 +41,12 @@ def fully_restored(c, run_id: int) -> bool:
 
 
 def changed_runs(c) -> list[int]:
-    """Execution runs that attempted at least one change (write-ahead rows count, even if never confirmed)."""
+    """Execution runs that attempted at least one change (write-ahead rows count, even if never confirmed),
+    since the last wipe: a reconnected or different account must prove restore again."""
+    row = c.execute("SELECT value FROM settings WHERE key='cleanup.cap_epoch'").fetchone()
+    epoch = int(json.loads(row[0])) if row else 0
     return [r[0] for r in c.execute("SELECT DISTINCT run_id FROM audit_log WHERE action IN ('archive','trash') "
-                                    "AND status='attempted' AND run_id IS NOT NULL ORDER BY run_id")]
+                                    "AND status='attempted' AND run_id > ? ORDER BY run_id", (epoch,))]
 
 
 class Executor:
@@ -52,7 +55,7 @@ class Executor:
         self.db = db
         self.provider = reader   # fresh reads for revalidation and confirmation
         self.writer = writer     # None while the account is read-only: nothing can be changed
-        self.first_run_cap = first_run_cap
+        self.first_run_cap = max(1, min(int(first_run_cap), 50))  # never uncapped by a bad setting
         self.retry = retry or RetryPolicy()
         self.chunk = min(chunk, writer.max_modify_batch if writer else CHUNK)
 
@@ -62,8 +65,20 @@ class Executor:
         return self.writer
 
     # -- run records ----------------------------------------------------------
+    def _same_account(self) -> None:
+        w = getattr(self.writer, "account_email", None)
+        if w is None:
+            return
+        try:
+            writer_account = w()
+        except ProviderError as e:  # e.g. cleanup permission expired: "reconnect cleanup"
+            raise ExecutionError(str(e)) from None
+        if writer_account.lower() != self.provider.account_email().lower():
+            raise ExecutionError("cleanup access belongs to a different Google account; disable and enable cleanup again")
+
     def create_run(self, plan_id: int) -> int:
         self._require_writer()
+        self._same_account()
         enabled_at = self.db.get_setting("cleanup.enabled_at")
         generation = int(self.db.get_setting("analysis.generation", 0) or 0)
         with self.db.tx() as c:
@@ -110,6 +125,7 @@ class Executor:
 
     def create_restore(self, source_run_id: int) -> int:
         self._require_writer()
+        self._same_account()
         with self.db.tx() as c:
             src = c.execute("SELECT * FROM runs WHERE id=?", (source_run_id,)).fetchone()
             if src is None or src["kind"] != "execute":

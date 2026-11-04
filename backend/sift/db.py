@@ -369,3 +369,5 @@ class Database:
                 c.execute(f"DELETE FROM {t}")
             c.execute("UPDATE ai_usage SET detail=NULL")  # keep the spend record, drop any text about senders
             c.execute("DELETE FROM settings WHERE key LIKE 'cleanup.%' OR key='labels.map'")
+            epoch = c.execute("SELECT COALESCE(MAX(id), 0) FROM runs").fetchone()[0]
+            c.execute("INSERT INTO settings(key,value) VALUES('cleanup.cap_epoch', ?)", (json.dumps(epoch),))

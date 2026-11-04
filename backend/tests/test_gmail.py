@@ -1147,9 +1147,8 @@ def test_writer_expiry_mid_run_surfaces_reconnect_cleanup(gmail_app, consent):
     recs = [r for r in c.get("/api/recommendations").json()["items"] if r["action"] != "review" and r["count"]]
     p = c.post("/api/plans", json={"items": [{"rec_id": recs[0]["id"]}]}).json()
     c.post(f"/api/plans/{p['id']}/approve", json={"confirm_hash": p["ids_hash"]})
-    r = c.post(f"/api/plans/{p['id']}/execute")
-    run = wait_run(c, r.json()["id"])
-    assert run["status"] == "failed" and "reconnect cleanup" in (run["error"] or "")
+    r = c.post(f"/api/plans/{p['id']}/execute")  # refused up front: the writer's account check needs a live token
+    assert r.status_code == 400 and "reconnect cleanup" in r.json()["detail"]
     st = c.get("/api/status").json()
     assert st["cleanup"]["state"] == "reauth_required" and "reconnect cleanup" in st["cleanup"]["error"]
     assert st["can_modify"] is False and st["connection"]["state"] == "connected"

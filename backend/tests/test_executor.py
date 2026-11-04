@@ -510,3 +510,31 @@ def test_wipe_with_runs_succeeds_and_keeps_history(db, provider, scanned, execut
         assert c.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 0
         assert c.execute("SELECT COUNT(*) FROM runs WHERE id=?", (rid,)).fetchone()[0] == 1
         assert c.execute("SELECT COUNT(*) FROM audit_log WHERE run_id=?", (rid,)).fetchone()[0] > 0
+
+
+def test_writer_for_another_account_is_refused(db, provider, scanned, executor, unlocked):
+    """Audit FAIL 1: reader and writer must be the same Google account."""
+    p = approved_plan(db)
+    class Other:
+        max_modify_batch = 1000
+        def account_email(self):
+            return "someone-else@example.test"
+    executor.writer = Other()
+    with pytest.raises(ExecutionError, match="different Google account"):
+        executor.create_run(p["id"])
+
+
+def test_wipe_resets_first_run_proof(db, provider, scanned, scanner, executor):
+    """Audit FAIL 3: after disconnect/account switch, an old restored run doesn't unlock the new account."""
+    p = approved_plan(db)
+    rid, _ = run(executor, p["id"])
+    assert executor.restore(executor.create_restore(rid)) == "completed"
+    db.wipe_analysis()
+    with pytest.raises(ExecutionError):
+        executor.unlock_full_runs()
+
+
+def test_cap_setting_is_clamped(db, provider, retry):
+    from sift.executor import Executor
+    assert Executor(db, provider, provider, first_run_cap=-1, retry=retry).first_run_cap == 1
+    assert Executor(db, provider, provider, first_run_cap=10_000, retry=retry).first_run_cap == 50

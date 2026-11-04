@@ -365,3 +365,13 @@ def test_disconnect_discards_batches_keeps_log(gmail_unsub):
         assert conn.execute("SELECT COUNT(*) FROM unsubscribe_batches").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM unsubscribe_log").fetchone()[0] == 1
     assert c.get(f"/api/unsubscribe/batches/{b['id']}").status_code == 404
+
+
+def test_sender_with_protected_mail_is_not_one_clicked(client):
+    """Audit FAIL 2: starred / replied / receipt mail from a sender keeps it out of one-click."""
+    c, state = client
+    target = senders_by_kind(state)["one_click"][0]
+    with state.db.connect() as conn:
+        conn.execute("UPDATE sender_groups SET protected=1 WHERE sender=?", (target,))
+    b = c.post("/api/unsubscribe/batches", json={"senders": [target]}).json()
+    assert b["items"][0]["method"] == "none" and "protected mail" in b["items"][0]["reason"]

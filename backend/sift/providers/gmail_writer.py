@@ -36,7 +36,7 @@ WRITE_COST = {"batch_modify": 50, "trash": 20, "untrash": 5, "label_create": 5, 
 MAX_BATCH_MODIFY_IDS = 1000
 # Labels that must not be set through batchModify: Trash goes through trash()/untrash(), and Sift never
 # files anything as spam.
-NOT_VIA_MODIFY = {"TRASH", "SPAM"}
+NOT_VIA_MODIFY = {"TRASH", "SPAM", "UNREAD"}  # UNREAD: Sift never marks mail read or unread
 
 
 class GmailWriter(MailWriter):
@@ -127,7 +127,7 @@ class GmailWriter(MailWriter):
         if len(ids) > self.max_modify_batch:
             raise PermanentError(f"batchModify accepts at most {self.max_modify_batch} ids")
         if NOT_VIA_MODIFY & (set(add) | set(remove)):
-            raise PermanentError("use trash()/untrash() for Trash; Sift never applies SPAM")
+            raise PermanentError("use trash()/untrash() for Trash; Sift never applies SPAM or changes UNREAD")
         if not add and not remove:
             raise PermanentError("batchModify needs at least one label to add or remove")
         body = {"ids": ids, "addLabelIds": list(add), "removeLabelIds": list(remove)}

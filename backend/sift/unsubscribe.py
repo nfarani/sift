@@ -297,10 +297,14 @@ def create_batch(db: Database, reader, senders: Iterable[str], user_email: str) 
         raise UnsubscribeError(f"at most {MAX_BATCH_SENDERS} senders per batch")
     ctx = load_context(db, user_email)
     newest: dict[str, str] = {}
+    has_protected: set[str] = set()
     with db.connect() as c:
         for s in wanted:
-            if not c.execute("SELECT 1 FROM sender_groups WHERE sender=?", (s,)).fetchone():
+            g = c.execute("SELECT protected FROM sender_groups WHERE sender=?", (s,)).fetchone()
+            if not g:
                 raise UnsubscribeError(f"unknown sender group: {s[:120]}")
+            if g[0]:
+                has_protected.add(s)
             r = c.execute("SELECT id FROM messages WHERE from_addr=? AND is_sent=0 "
                           "ORDER BY internal_date DESC, id DESC LIMIT 1", (s,)).fetchone()
             if r:
@@ -315,6 +319,9 @@ def create_batch(db: Database, reader, senders: Iterable[str], user_email: str) 
             continue
         if s in ctx.protected_senders or domain in ctx.protected_domains:
             items.append({**base, "method": "none", "reason": "protected by your rule"})
+            continue
+        if s in has_protected:  # starred, a thread with your reply, receipts/security/finance mail
+            items.append({**base, "method": "none", "reason": "has protected mail: unsubscribe manually if you mean it"})
             continue
         m = metas.get(newest.get(s))
         if m is None or m.from_addr.lower() != s:
