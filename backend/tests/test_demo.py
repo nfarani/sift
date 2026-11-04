@@ -73,6 +73,49 @@ def test_masked_sender_survives_restart_and_unknown_masks_are_refused(client):  
     c2 = TestClient(create_app(state), headers={"X-Sift": "1"})  # fresh masker, as after a restart
     p = c2.post("/api/plans", json={"items": [{"rec_id": rec["id"], "excluded_senders": [masked]}]})
     assert p.status_code == 200
-    bogus = "z***dead@nowhere.example"
+    bogus = "z***deadbeef@nowhere.example"
     r = c2.post("/api/plans", json={"items": [{"rec_id": rec["id"], "excluded_senders": [bogus]}]})
-    assert r.status_code == 409 and "lost track" in r.json()["detail"]
+    assert r.status_code == 409 and "masked" in r.json()["detail"]
+
+
+def test_masked_address_refused_when_demo_is_off(client):  # noqa: F811
+    """Audit BLOCKING 1: a stale demo-mode page can't save a masked string as an exclusion or rule."""
+    c, state = client
+    c.post("/api/scan")
+    wait(c, "/api/scan")
+    c.post("/api/demo", json={"enabled": True})
+    rec = next(r for r in c.get("/api/recommendations").json()["items"] if r["action"] == "archive")
+    masked = rec["senders"][0]["sender"]
+    c.post("/api/demo", json={"enabled": False})
+    r = c.post("/api/plans", json={"items": [{"rec_id": rec["id"], "excluded_senders": [masked]}]})
+    assert r.status_code == 409
+    r = c.post("/api/protection-rules", json={"kind": "sender", "value": masked})
+    assert r.status_code == 409
+
+
+def test_list_ids_are_masked(client):  # noqa: F811
+    """Audit FAIL 2."""
+    c, state = client
+    c.post("/api/scan")
+    wait(c, "/api/scan")
+    with state.db.connect() as x:
+        lids = {r[0] for r in x.execute("SELECT DISTINCT list_id FROM sender_groups WHERE list_id LIKE '%@%' "
+                                        "OR list_id GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9]*'")}
+        x.execute("UPDATE sender_groups SET list_id='<news.12345678.person@mail.example.com>' WHERE rowid=1")
+    c.post("/api/demo", json={"enabled": True})
+    body = c.get("/api/recommendations").text
+    assert "person@mail.example.com" not in body and "12345678" not in body
+    assert not [l for l in lids if l and l in body]
+
+
+def test_colliding_masks_are_never_unmasked():
+    """Audit FAIL 3: if two addresses ever share a mask, the mask maps to neither."""
+    from sift.demo import Masker, UnknownMasked
+    import pytest
+    m = Masker()
+    a = m.address("ann@x.example")
+    m._reverse[a + "x"] = "unused"
+    m._reverse[a] = "ann@x.example"
+    m._ambiguous.add(a)  # simulate a collision
+    with pytest.raises(UnknownMasked):
+        m.unmask({"excluded_senders": [a]})

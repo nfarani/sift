@@ -83,7 +83,11 @@ before it reaches the browser:
 - subjects and previews → hidden
 - your own name and address, and digit runs of 6+ (order numbers, codes) → masked
 
-Actions keep working: the backend maps masked addresses back to the real ones on requests. A badge shows demo mode
+Claude's per-sender reasons are kept (they explain the recommendation) with addresses and person names masked;
+they can still name a brand. Your own label names can appear in run skip reasons.
+
+Actions keep working: the backend maps masked addresses back to the real ones on requests, and refuses any masked
+address it can't map (for example from a page left open after demo mode was switched off). A badge shows demo mode
 is on. `./start.sh` also prints the masked address when demo mode is on. Google's own consent screen is outside
 Sift and is not masked.
 

@@ -21,7 +21,8 @@ import threading
 EMAIL = re.compile(r"[A-Za-z0-9._%+\-=]+@([A-Za-z0-9\-]+\.)+[A-Za-z]{2,}")
 DIGITS = re.compile(r"\d{6,}")  # order numbers, codes, phones; leaves dates and run labels readable
 HIDDEN = "[hidden in demo mode]"
-MASKED = re.compile(r"^[a-z0-9]?\*\*\*[0-9a-f]{4}@[a-z0-9.\-]+$")
+HASH_LEN = 8
+MASKED = re.compile(r"^.?\*\*\*[0-9a-f]{%d}@\S+$" % HASH_LEN)  # any string address() could have produced
 # Filter terms you typed yourself (Ask): shown and saved as typed.
 USER_TERMS = {"sender_contains", "subject_contains_any", "subject_excludes_any", "text", "query"}
 
@@ -39,6 +40,8 @@ def _passthrough(key: str | None) -> bool:
     if not key:
         return False
     k = key.lower()
+    if k == "list_id":  # List-Ids can carry addresses and account numbers: masked like free text
+        return False
     return k in USER_TERMS or k == "id" or k.endswith(("_id", "_ids", "hash", "_at", "status", "state", "kind", "action"))
 
 
@@ -50,6 +53,7 @@ class Masker:
     def __init__(self):
         self._lock = threading.Lock()
         self._reverse: dict[str, str] = {}      # masked address -> real address
+        self._ambiguous: set[str] = set()       # masks shared by two real addresses: never unmasked
         self._names: dict[str, str] = {}        # real display name (lower) -> pseudonym
         self._own_tokens: set[str] = set()
 
@@ -67,8 +71,11 @@ class Masker:
 
     def address(self, addr: str) -> str:
         local, _, domain = addr.partition("@")
-        masked = f"{local[:1].lower()}***{_h(addr)}@{domain.lower()}"
+        masked = f"{local[:1].lower()}***{_h(addr, HASH_LEN)}@{domain.lower()}"
         with self._lock:
+            prev = self._reverse.get(masked)
+            if prev is not None and prev.lower() != addr.lower():
+                self._ambiguous.add(masked)
             self._reverse[masked] = addr
         return masked
 
@@ -114,7 +121,7 @@ class Masker:
             return [self.unmask(v) for v in obj]
         if isinstance(obj, str):
             with self._lock:
-                real = self._reverse.get(obj)
+                real = None if obj in self._ambiguous else self._reverse.get(obj)
             if real is None and MASKED.match(obj):
                 raise UnknownMasked(obj)  # never act on a masked address we can't map back
             return real or obj
@@ -127,17 +134,28 @@ class Masker:
                 self.address(a)
 
 
+def _has_masked(obj) -> bool:
+    if isinstance(obj, dict):
+        return any(_has_masked(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_has_masked(v) for v in obj)
+    return isinstance(obj, str) and bool(MASKED.match(obj))
+
+
 class DemoMiddleware:
-    """Pure ASGI middleware: masks JSON responses under /api/ and unmasks JSON request bodies,
-    only while `enabled()` is true."""
+    """Pure ASGI middleware for /api/. While `enabled()`: masks JSON responses and unmasks JSON request bodies.
+    Always (demo on or off): refuses a request carrying a masked address it can't map back, so a stale demo-mode
+    page can never save a masked string as a sender exclusion or rule."""
 
     def __init__(self, app, masker: Masker, enabled, refresh):
         self.app, self.masker, self.enabled, self.refresh = app, masker, enabled, refresh
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope["path"].startswith("/api/") or not self.enabled():
+        if scope["type"] != "http" or not scope["path"].startswith("/api/"):
             return await self.app(scope, receive, send)
-        self.refresh()
+        on = self.enabled()
+        if on:
+            self.refresh()
 
         async def receive_unmasked():
             msg = await receive()
@@ -153,7 +171,10 @@ class DemoMiddleware:
                         data = None
                     if data is not None:
                         try:
-                            body = json.dumps(self.masker.unmask(data)).encode()
+                            if on:
+                                body = json.dumps(self.masker.unmask(data)).encode()
+                            elif _has_masked(data):
+                                raise UnknownMasked("demo mode is off")
                         except UnknownMasked:
                             body = b'{"__sift_unknown_masked__": true}'  # rejected below; nothing is acted on
                 return {"type": "http.request", "body": body, "more_body": False}
@@ -173,7 +194,7 @@ class DemoMiddleware:
                 body = b"".join(chunks)
                 headers = [(k, v) for k, v in start.get("headers", []) if k.lower() != b"content-length"]
                 ctype = dict(start.get("headers", [])).get(b"content-type", b"")
-                if body and ctype.startswith(b"application/json"):
+                if on and body and ctype.startswith(b"application/json"):
                     try:
                         body = json.dumps(self.masker.mask(json.loads(body))).encode()
                     except ValueError:
@@ -187,8 +208,9 @@ class DemoMiddleware:
         # Peek once so an unmappable masked address is refused before the route runs.
         first = await receive_unmasked()
         if first.get("body") == b'{"__sift_unknown_masked__": true}':
-            body = json.dumps({"detail": "demo mode lost track of a masked sender (the backend restarted?); "
-                                         "reload the page and try again"}).encode()
+            body = json.dumps({"detail": "this request contains a masked demo-mode address that can't be mapped back "
+                                         "(demo mode was switched or the backend restarted); reload the page and "
+                                         "try again"}).encode()
             await send({"type": "http.response.start", "status": 409,
                         "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
             await send({"type": "http.response.body", "body": body})
@@ -201,4 +223,8 @@ class DemoMiddleware:
                 return first
             return await receive()
 
-        await self.app(scope, replay, send_masked)
+        if first.get("type") == "http.request":  # the body may have changed length
+            n = str(len(first.get("body", b""))).encode()
+            scope = {**scope, "headers": [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"content-length"]
+                     + [(b"content-length", n)]}
+        await self.app(scope, replay, send_masked if on else send)
