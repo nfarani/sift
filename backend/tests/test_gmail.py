@@ -16,6 +16,7 @@ from sift.providers import gmail as gmail_mod
 from sift.providers import gmail_auth
 from sift.providers.base import MailReader, MailWriter, PermanentError, TransientError
 from sift.providers.gmail import GmailReader, QuotaLimiter, _parse
+from sift.providers.gmail_writer import GmailWriter
 from sift.providers.gmail_auth import READONLY_SCOPE, AuthError, TokenStore, check_scopes
 
 FAKE_TOKEN = "ya29.FAKE-ACCESS-TOKEN-should-never-leak"
@@ -25,6 +26,21 @@ FAKE_REFRESH = "1//FAKE-REFRESH-TOKEN-should-never-leak"
 def http_error(status, reason="err"):
     body = json.dumps({"error": {"code": status, "message": reason, "errors": [{"reason": reason}]}}).encode()
     return HttpError(httplib2.Response({"status": status, "reason": reason}), body, uri="https://example.invalid")
+
+
+@pytest.fixture(autouse=True)
+def no_real_revoke(monkeypatch):
+    """Tests must never reach oauth2.googleapis.com. Any revoke that isn't faked by the test is recorded here."""
+    calls = []
+
+    class NoNetwork:
+        def __call__(self, *a, **k):
+            raise AssertionError("a test tried to refresh a token over the network")
+
+    monkeypatch.setattr(gmail_auth, "Request", NoNetwork)
+    monkeypatch.setattr(gmail_auth, "revoke", lambda creds, opener=None: calls.append(creds) or True)
+    monkeypatch.setattr("sift.api.revoke", lambda creds: calls.append(creds) or True)
+    return calls
 
 
 # --- fake Gmail service ---------------------------------------------------------------------------
@@ -73,7 +89,27 @@ class FakeCreds:
     granted_scopes = [READONLY_SCOPE]
 
     def to_json(self):
-        return json.dumps({"token": self.token, "refresh_token": self.refresh_token, "scopes": self.scopes})
+        return creds_json(self.scopes, self.token, self.refresh_token)
+
+
+MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+WRITER_SCOPES = [MODIFY_SCOPE, READONLY_SCOPE]
+FAKE_WRITER_TOKEN = "ya29.FAKE-WRITER-ACCESS-should-never-leak"
+FAKE_WRITER_REFRESH = "1//FAKE-WRITER-REFRESH-should-never-leak"
+
+
+def creds_json(scopes=(READONLY_SCOPE,), token=FAKE_TOKEN, refresh=FAKE_REFRESH):
+    """Authorized-user JSON that google.oauth2.credentials can really load (no expiry => valid)."""
+    return json.dumps({"token": token, "refresh_token": refresh, "client_id": "fake.apps.example",
+                       "client_secret": "fake-secret", "token_uri": "https://oauth2.example.invalid/token",
+                       "expiry": "2099-01-01T00:00:00Z", "scopes": list(scopes)})
+
+
+class WriterCreds(FakeCreds):
+    token = FAKE_WRITER_TOKEN
+    refresh_token = FAKE_WRITER_REFRESH
+    scopes = WRITER_SCOPES
+    granted_scopes = WRITER_SCOPES
 
 
 class FakeKeyring:
@@ -116,11 +152,36 @@ class G:
             return {"messages": [{"id": i} for i in page], "nextPageToken": nxt, "resultSizeEstimate": len(ids)}
         if kind == "threads.get":
             assert kw["format"] == "minimal"
-            return self.thr[key]
+            if key in self.thr:
+                return self.thr[key]
+            return {"id": key, "messages": [{"labelIds": m["labelIds"]} for m in self.msgs.values()
+                                            if m["threadId"] == key]}
         if kind == "labels.get":
             return {"id": key, "messagesTotal": sum(key in m["labelIds"] for m in self.msgs.values())}
         if kind == "labels.list":
             return {"labels": self.lbls}
+        if kind == "labels.create":
+            if any(l["name"].casefold() == kw["body"]["name"].casefold() for l in self.lbls):
+                raise http_error(409, "duplicate")
+            lbl = {"id": f"Label_{100 + len(self.lbls)}", "name": kw["body"]["name"]}
+            self.lbls.append(lbl)
+            return lbl
+        if kind == "messages.batchModify":
+            body = kw["body"]
+            assert len(body["ids"]) <= 1000
+            for mid in body["ids"]:
+                m = self.msgs.get(mid)
+                if m is None:
+                    continue
+                labels = [l for l in m["labelIds"] if l not in body["removeLabelIds"]]
+                m["labelIds"] = labels + [l for l in body["addLabelIds"] if l not in labels]
+            return {}
+        if kind in ("messages.trash", "messages.untrash"):
+            if key not in self.msgs:
+                raise http_error(404, "notFound")
+            m = self.msgs[key]
+            m["labelIds"] = [l for l in m["labelIds"] if l != "TRASH"] + (["TRASH"] if kind == "messages.trash" else [])
+            return {"id": key, "labelIds": m["labelIds"]}
         raise AssertionError(kind)
 
 
@@ -131,7 +192,7 @@ class _Node:
     def __getattr__(self, name):
         if name in ("messages", "threads", "labels"):
             return lambda: _Node(self.g, name)
-        if name in ("get", "list", "getProfile"):
+        if name in ("get", "list", "getProfile", "create", "batchModify", "trash", "untrash"):
             kind = f"{self.path}.{name}" if self.path else name
             return lambda **kw: Req(self.g, kind, kw)
         raise AttributeError(name)
@@ -288,8 +349,7 @@ def gmail_app(tmp_path, monkeypatch, retry):
     s.client_secrets = tmp_path / "client_secret.json"
     kr = FakeKeyring()
     store = TokenStore(kr)
-    kr.set_password("sift-gmail", "oauth-token", FakeCreds().to_json())
-    monkeypatch.setattr(TokenStore, "load", lambda self: FakeCreds() if self.backend.store else None)
+    kr.set_password("sift-gmail", "oauth-token", creds_json())
     msgs = {f"i{i:04}": msg(f"i{i:04}", thread=f"t{i}", subject="50% off everything",
                             labels=("INBOX", "UNREAD", "CATEGORY_PROMOTIONS"),
                             extra=[("List-Id", "<deals.shop.example>")]) for i in range(700)}
@@ -299,9 +359,19 @@ def gmail_app(tmp_path, monkeypatch, retry):
     revoked = []
     monkeypatch.setattr("sift.api.revoke", lambda creds: revoked.append(True) or True)
     state = build_state(s, retry=retry, token_store=store,
-                        reader_factory=lambda creds, st: reader(g))
+                        reader_factory=lambda creds, st: reader(g), writer_factory=fake_writer_factory(g))
     state.scanner.page_size = 100
     return TestClient(create_app(state), headers={"X-Sift": "1"}), state, g, kr, revoked
+
+
+def fake_writer_factory(g, made=None):
+    def make(creds, store, limiter, on_reauth):
+        w = GmailWriter(creds, store, limiter=limiter or QuotaLimiter(10**9), service_factory=lambda c: g,
+                        on_reauth=on_reauth)
+        if made is not None:
+            made.append(w)
+        return w
+    return make
 
 
 def wait_scan(c):
@@ -351,7 +421,8 @@ def test_disconnect_revokes_deletes_token_and_local_metadata(gmail_app):
     c.post("/api/scan", json={"max_messages": 50})
     wait_scan(c)
     r = c.post("/api/gmail/disconnect").json()
-    assert r == {"revoked_at_google": True, "local_token_deleted": True, "local_metadata_deleted": True}
+    assert r == {"revoked_at_google": True, "local_token_deleted": True, "local_metadata_deleted": True,
+                 "cleanup_revoked_at_google": False, "cleanup_token_deleted": True, "problems": []}
     assert revoked and kr.store == {}
     with state.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
@@ -491,3 +562,596 @@ def test_no_scan_while_connecting(gmail_app):
     c, state, *_ = gmail_app
     state.connection = {"state": "connecting", "error": None}
     assert c.post("/api/scan").status_code == 409
+
+
+# =====================================================================================================
+# Phase 4: GmailWriter, separate writer token, Enable/Disable cleanup, corrupt keychain entries
+# =====================================================================================================
+from google.auth.exceptions import RefreshError
+
+from sift.providers import gmail_writer as writer_mod
+from sift.providers.gmail_auth import (WRITER, CleanupReauthRequired, CorruptToken, ReauthRequired,
+                                       WRITER_KEYRING_SERVICE, fresh)
+
+
+class CountingLimiter:
+    def __init__(self):
+        self.units = []
+
+    def acquire(self, units):
+        self.units.append(units)
+
+
+def writer(g, limiter=None, on_reauth=None, creds=None):
+    return GmailWriter(creds or WriterCreds(), TokenStore(FakeKeyring(), WRITER_KEYRING_SERVICE),
+                       limiter=limiter or QuotaLimiter(10**9), service_factory=lambda c: g, on_reauth=on_reauth)
+
+
+def calls(g, kind):
+    return [kw for k, kw in g.calls if k == kind]
+
+
+# --- GmailWriter ----------------------------------------------------------------------------------
+def test_writer_interface_and_no_destructive_methods():
+    assert issubclass(GmailWriter, MailWriter) and not issubclass(GmailWriter, MailReader)
+    assert GmailWriter.max_modify_batch == 1000
+    for name in ("delete", "batch_delete", "send", "empty_trash", "draft", "get_metadata", "list_message_ids"):
+        assert not hasattr(GmailWriter, name)
+    src = inspect.getsource(writer_mod)
+    for forbidden in (".delete(", "batchDelete", ".send(", "drafts", "emptyTrash", "format=\"full\"", "raw"):
+        assert forbidden not in src
+
+
+def test_ensure_label_finds_existing_case_insensitively():
+    g = G({}, labels=[{"id": "INBOX", "name": "INBOX"}, {"id": "Label_7", "name": "Sift/2026-11-04-run-12"}])
+    w = writer(g)
+    assert w.ensure_label("sift/2026-11-04-RUN-12") == "Label_7"
+    assert calls(g, "labels.create") == []
+
+
+def test_ensure_label_creates_once_then_cached():
+    g = G({})
+    w = writer(g)
+    lid = w.ensure_label("Sift/2026-11-04-run-12")
+    assert w.ensure_label("Sift/2026-11-04-run-12") == lid
+    created = calls(g, "labels.create")
+    assert len(created) == 1
+    assert created[0]["body"] == {"name": "Sift/2026-11-04-run-12", "labelListVisibility": "labelShow",
+                                  "messageListVisibility": "show"}
+    # A fresh writer (e.g. after restart) finds it instead of creating a duplicate.
+    assert writer(g).ensure_label("Sift/2026-11-04-run-12") == lid
+    assert len(calls(g, "labels.create")) == 1
+
+
+def test_ensure_label_409_race_resolves_to_existing():
+    g = G({})
+    w = writer(g)
+    real = g.handle
+
+    def racing(kind, kw):
+        if kind == "labels.create":  # someone else created it between our list and our create
+            g.lbls.append({"id": "Label_55", "name": kw["body"]["name"]})
+        return real(kind, kw)
+
+    g.handle = racing
+    assert w.ensure_label("Sift/x") == "Label_55"
+
+
+def test_ensure_label_rejects_empty_name():
+    with pytest.raises(PermanentError):
+        writer(G({})).ensure_label("  ")
+
+
+def test_batch_modify_body_limit_and_guards():
+    g = G({"a": msg("a"), "b": msg("b")})
+    w = writer(g)
+    w.batch_modify(["a", "b", "a"], add=["Label_9"], remove=["INBOX"])
+    body = calls(g, "messages.batchModify")[0]["body"]
+    assert body == {"ids": ["a", "b"], "addLabelIds": ["Label_9"], "removeLabelIds": ["INBOX"]}
+    assert "INBOX" not in g.msgs["a"]["labelIds"] and "Label_9" in g.msgs["a"]["labelIds"]
+    with pytest.raises(PermanentError):
+        w.batch_modify([f"m{i}" for i in range(1001)], add=["Label_9"], remove=[])
+    for bad in (dict(add=["TRASH"], remove=[]), dict(add=[], remove=["TRASH"]), dict(add=["SPAM"], remove=[]),
+                dict(add=[], remove=[])):
+        with pytest.raises(PermanentError):
+            w.batch_modify(["a"], **bad)
+    w.batch_modify([], add=["Label_9"], remove=[])  # nothing to do: no call
+    assert len(calls(g, "messages.batchModify")) == 1
+
+
+def test_trash_untrash():
+    g = G({"a": msg("a")})
+    w = writer(g)
+    w.trash("a")
+    assert "TRASH" in g.msgs["a"]["labelIds"]
+    w.untrash("a")
+    assert "TRASH" not in g.msgs["a"]["labelIds"]
+    with pytest.raises(PermanentError):
+        w.trash("missing")
+
+
+def test_writer_quota_costs_match_google_table():
+    lim = CountingLimiter()
+    g = G({"a": msg("a")})
+    w = writer(g, limiter=lim)
+    w.ensure_label("Sift/run")       # labels.list 1 + labels.create 5
+    w.batch_modify(["a"], add=["INBOX"], remove=[])   # 50
+    w.trash("a")                     # 20
+    w.untrash("a")                   # 5
+    assert lim.units == [1, 5, 50, 20, 5]
+
+
+@pytest.mark.parametrize("status,reason", [(429, "rateLimitExceeded"), (500, "backendError"), (503, "x"),
+                                           (403, "userRateLimitExceeded")])
+def test_writer_transient_errors_for_retry_policy(status, reason):
+    g = G({"a": msg("a")})
+    g.fail = {"a": [(status, reason)]}
+    with pytest.raises(TransientError):
+        writer(g).trash("a")
+
+
+def test_writer_backs_off_and_succeeds_through_retry_policy(sleeps, retry):
+    g = G({"a": msg("a")})
+    g.fail = {"a": [(429, "rateLimitExceeded"), (503, "x")]}
+    retry.call(lambda: writer(g).trash("a"))
+    assert sleeps == [0.5, 1.0] and "TRASH" in g.msgs["a"]["labelIds"]
+
+
+def test_writer_permission_error_is_permanent():
+    g = G({"a": msg("a")})
+    g.fail = {"a": [(403, "insufficientPermissions")]}
+    with pytest.raises(PermanentError) as e:
+        writer(g).trash("a")
+    assert not isinstance(e.value, TransientError)
+
+
+def test_writer_dead_refresh_token_means_reconnect_cleanup():
+    hit = []
+
+    class Expired(WriterCreds):
+        valid = False
+
+        def refresh(self, request):
+            raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+    w = writer(G({"a": msg("a")}), on_reauth=lambda: hit.append(1), creds=Expired())
+    with pytest.raises(CleanupReauthRequired) as e:
+        w.trash("a")
+    assert "reconnect cleanup" in str(e.value) and hit == [1]
+    assert FAKE_WRITER_REFRESH not in str(e.value)
+
+
+def test_writer_refresh_error_mid_request_means_reconnect_cleanup():
+    class Svc(G):
+        def handle(self, kind, kw):
+            raise RefreshError("invalid_grant")
+
+    hit = []
+    with pytest.raises(CleanupReauthRequired):
+        writer(Svc({}), on_reauth=lambda: hit.append(1)).trash("a")
+    assert hit == [1]
+
+
+# --- scopes and the refresh re-check ----------------------------------------------------------------
+@pytest.mark.parametrize("scopes", [
+    [READONLY_SCOPE],                                            # no modify
+    [MODIFY_SCOPE, "https://www.googleapis.com/auth/gmail.send"],
+    [MODIFY_SCOPE, "https://" + "mail.google.com/"],
+    [MODIFY_SCOPE, "https://www.googleapis.com/auth/gmail.compose"],
+])
+def test_writer_tokens_with_wrong_scopes_refused(scopes):
+    c = WriterCreds()
+    c.granted_scopes = scopes
+    with pytest.raises(AuthError):
+        check_scopes(c, WRITER)
+
+
+def test_writer_scopes_accepted():
+    check_scopes(WriterCreds(), WRITER)
+    c = WriterCreds()
+    c.granted_scopes = [MODIFY_SCOPE]
+    check_scopes(c, WRITER)
+
+
+def test_enable_cleanup_consent_requests_modify_and_loopback(monkeypatch, tmp_path):
+    seen = {}
+
+    class Flow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes):
+            seen["scopes"] = scopes
+            return cls()
+
+        def run_local_server(self, **kw):
+            seen.update(kw)
+            return WriterCreds() if MODIFY_SCOPE in seen["scopes"] else FakeCreds()
+
+    monkeypatch.setattr(gmail_auth, "InstalledAppFlow", Flow)
+    secrets = tmp_path / "cs.json"
+    secrets.write_text("{}")
+    gmail_auth.run_consent_flow(secrets, role=WRITER)
+    assert seen["scopes"] == [MODIFY_SCOPE, READONLY_SCOPE]
+    assert seen["host"] == "127.0.0.1" and seen["port"] == 0
+    # The reader consent is unchanged: read-only only.
+    gmail_auth.run_consent_flow(secrets)
+    assert seen["scopes"] == [READONLY_SCOPE]
+
+
+@pytest.mark.parametrize("granted", [[MODIFY_SCOPE, "https://" + "mail.google.com/"],
+                                     [MODIFY_SCOPE, "https://www.googleapis.com/auth/gmail.send"],
+                                     [READONLY_SCOPE]])
+def test_writer_consent_with_bad_scopes_refused_and_revoked(monkeypatch, tmp_path, granted):
+    bad = WriterCreds()
+    bad.granted_scopes = granted
+
+    class Flow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes):
+            return cls()
+
+        def run_local_server(self, **kw):
+            return bad
+
+    revoked = []
+    monkeypatch.setattr(gmail_auth, "InstalledAppFlow", Flow)
+    monkeypatch.setattr(gmail_auth, "revoke", lambda c: revoked.append(c) or True)
+    secrets = tmp_path / "cs.json"
+    secrets.write_text("{}")
+    with pytest.raises(AuthError):
+        gmail_auth.run_consent_flow(secrets, role=WRITER)
+    assert revoked == [bad]
+
+
+class Refreshing(FakeCreds):
+    """valid=False until refresh(); refresh() reports the given granted scopes, like google-auth does."""
+
+    def __init__(self, scopes, granted_after):
+        self.valid = False
+        self.scopes = scopes
+        self.granted_scopes = scopes
+        self._after = granted_after
+
+    def refresh(self, request):
+        self.valid = True
+        self.granted_scopes = self._after
+
+
+def test_reader_refresh_that_gains_modify_is_refused_and_not_saved(monkeypatch):
+    kr = FakeKeyring()
+    store = TokenStore(kr)
+    kr.set_password("sift-gmail", "oauth-token", "old")
+    revoked = []
+    monkeypatch.setattr(gmail_auth, "revoke", lambda c: revoked.append(c) or True)
+    import threading
+    with pytest.raises(ReauthRequired) as e:
+        fresh(Refreshing([READONLY_SCOPE], [READONLY_SCOPE, MODIFY_SCOPE]), store, threading.Lock())
+    assert not isinstance(e.value, CleanupReauthRequired)
+    assert kr.store == {} and revoked == []  # dropped locally; modify isn't "dangerous", so no revoke
+
+
+def test_writer_refresh_with_forbidden_scope_is_revoked(monkeypatch):
+    kr = FakeKeyring()
+    store = TokenStore(kr, WRITER_KEYRING_SERVICE)
+    revoked = []
+    monkeypatch.setattr(gmail_auth, "revoke", lambda c: revoked.append(c) or True)
+    import threading
+    c = Refreshing(WRITER_SCOPES, WRITER_SCOPES + ["https://" + "mail.google.com/"])
+    with pytest.raises(CleanupReauthRequired):
+        fresh(c, store, threading.Lock(), role=WRITER)
+    assert revoked == [c]
+
+
+def test_good_refresh_is_saved():
+    import threading
+    kr = FakeKeyring()
+    store = TokenStore(kr, WRITER_KEYRING_SERVICE)
+    fresh(Refreshing(WRITER_SCOPES, WRITER_SCOPES), store, threading.Lock(), role=WRITER)
+    assert (WRITER_KEYRING_SERVICE, "oauth-token") in kr.store
+
+
+# --- token storage ------------------------------------------------------------------------------------
+def test_reader_and_writer_tokens_are_separate_keychain_entries():
+    kr = FakeKeyring()
+    r = TokenStore(kr)
+    w = r.for_writer()
+    kr.set_password("sift-gmail", "oauth-token", creds_json())
+    kr.set_password(WRITER_KEYRING_SERVICE, "oauth-token", creds_json(WRITER_SCOPES, FAKE_WRITER_TOKEN,
+                                                                       FAKE_WRITER_REFRESH))
+    assert r.load().scopes == [READONLY_SCOPE]
+    assert set(w.load().scopes) == set(WRITER_SCOPES)
+    w.delete()
+    assert w.load() is None and r.load() is not None
+
+
+@pytest.mark.parametrize("raw", ["{not json", '{"token": "x"}', "[]"])
+def test_corrupt_entry_raises_then_is_discarded(raw):
+    kr = FakeKeyring()
+    store = TokenStore(kr)
+    kr.set_password("sift-gmail", "oauth-token", raw)
+    with pytest.raises(CorruptToken) as e:
+        store.load()
+    assert raw not in str(e.value)
+    creds, problem = store.load_or_discard()
+    assert creds is None and "removed" in problem and kr.store == {}
+
+
+class BrokenKeyring(FakeKeyring):
+    def get_password(self, s, u):
+        raise RuntimeError("keychain locked")
+
+    def delete_password(self, s, u):
+        raise RuntimeError("keychain locked")
+
+
+def test_unreadable_and_undeletable_entry_is_reported_not_raised():
+    creds, problem = TokenStore(BrokenKeyring()).load_or_discard()
+    assert creds is None and "Keychain Access" in problem
+
+
+# --- API: Enable / Disable cleanup ---------------------------------------------------------------------
+@pytest.fixture
+def consent(monkeypatch, gmail_app):
+    """Fake the browser consent: returns whatever creds the test sets."""
+    box = {"creds": WriterCreds(), "roles": []}
+
+    def flow(path, timeout_s=300, role="reader"):
+        box["roles"].append(role)
+        return box["creds"]
+
+    monkeypatch.setattr("sift.api.run_consent_flow", flow)
+    gmail_app[0].app.state.sift.settings.client_secrets.write_text("{}")
+    return box
+
+
+def wait_cleanup(c, done=("enabled", "error", "disabled", "reauth_required")):
+    for _ in range(200):
+        st = c.get("/api/status").json()
+        if st["cleanup"]["state"] in done:
+            return st
+        time.sleep(0.02)
+    raise AssertionError("cleanup flow timeout")
+
+
+def enable(c):
+    r = c.post("/api/cleanup/enable")
+    assert r.status_code == 200, r.text
+    return wait_cleanup(c)
+
+
+def backdate_enable(state):
+    """Plans/batches must be approved strictly after cleanup was enabled (1 s resolution). Tests that
+    approve within the same second move the enable time back instead of sleeping."""
+    state.db.set_setting("cleanup.enabled_at", "2000-01-01T00:00:00+00:00")
+
+
+def test_enable_cleanup_stores_separate_writer_token(gmail_app, consent):
+    c, state, g, kr, _ = gmail_app
+    st = c.get("/api/status").json()
+    assert st["can_modify"] is False and st["cleanup"]["state"] == "disabled"
+    st = enable(c)
+    assert consent["roles"] == [WRITER]
+    assert st["can_modify"] is True and st["cleanup"]["state"] == "enabled" and "gmail.modify" in st["mode"]
+    assert isinstance(state.writer, GmailWriter) and state.executor.writer is state.writer
+    # Reader keeps its read-only token; the writer has its own entry.
+    assert json.loads(kr.store[("sift-gmail", "oauth-token")])["scopes"] == [READONLY_SCOPE]
+    assert set(json.loads(kr.store[(WRITER_KEYRING_SERVICE, "oauth-token")])["scopes"]) == set(WRITER_SCOPES)
+    assert state.db.get_setting("cleanup.enabled_at")
+    blob = json.dumps(st)
+    for secret in (FAKE_TOKEN, FAKE_REFRESH, FAKE_WRITER_TOKEN, FAKE_WRITER_REFRESH):
+        assert secret not in blob
+    # Writer shares the reader's quota bucket.
+    assert state.writer.limiter is state.provider.limiter
+
+
+def test_enable_cleanup_needs_reader_and_gmail_mode(gmail_app, consent, tmp_path, provider, retry):
+    c, state, *_ = gmail_app
+    state.attach(None, None)
+    state.connection = {"state": "disconnected", "error": None}
+    assert c.post("/api/cleanup/enable").status_code == 409
+    s = Settings()
+    s.data_dir = tmp_path / "m"
+    s.extra_allowed_hosts = ("testserver",)
+    mock = TestClient(create_app(build_state(s, provider=provider, retry=retry)), headers={"X-Sift": "1"})
+    assert mock.post("/api/cleanup/enable").status_code == 404
+    assert mock.get("/api/status").json()["cleanup"]["state"] == "enabled"  # synthetic: can modify synthetic data
+
+
+def test_enable_cleanup_for_other_account_refused(gmail_app, consent, monkeypatch):
+    c, state, g, kr, _ = gmail_app
+    c.get("/api/status")  # caches nick@example.com
+    other = G({}, labels=[])
+    other_handle = other.handle
+    other.handle = lambda kind, kw: ({"emailAddress": "someone@else.example"} if kind == "getProfile"
+                                     else other_handle(kind, kw))
+    state.writer_factory = fake_writer_factory(other)
+    revoked = []
+    monkeypatch.setattr("sift.api.revoke", lambda creds: revoked.append(creds) or True)
+    st = enable(c)
+    assert st["cleanup"]["state"] == "error" and "different Google account" in st["cleanup"]["error"]
+    assert st["can_modify"] is False and state.writer is None
+    assert (WRITER_KEYRING_SERVICE, "oauth-token") not in kr.store and revoked == [consent["creds"]]
+
+
+def test_enable_cleanup_bad_scopes_reported(gmail_app, monkeypatch):
+    c, state, *_ = gmail_app
+    state.settings.client_secrets.write_text("{}")
+
+    def refused(path, timeout_s=300, role="reader"):
+        raise AuthError("refusing token with unexpected scopes: ['x']")
+
+    monkeypatch.setattr("sift.api.run_consent_flow", refused)
+    st = enable(c)
+    assert st["cleanup"]["state"] == "error" and "unexpected scopes" in st["cleanup"]["error"]
+    assert st["can_modify"] is False
+
+
+def test_disable_cleanup_deletes_only_writer(gmail_app, consent):
+    c, state, g, kr, revoked = gmail_app
+    enable(c)
+    r = c.post("/api/cleanup/disable").json()
+    assert r["revoked_at_google"] is True and r["local_writer_token_deleted"] is True
+    assert r["status"]["can_modify"] is False and r["status"]["cleanup"]["state"] == "disabled"
+    assert (WRITER_KEYRING_SERVICE, "oauth-token") not in kr.store
+    assert ("sift-gmail", "oauth-token") in kr.store
+    assert state.writer is None and state.provider is not None and state.executor.writer is None
+    assert c.get("/api/status").json()["connection"]["state"] == "connected"
+
+
+def test_startup_attaches_writer_only_with_valid_token(tmp_path, retry):
+    def boot(kr):
+        s = Settings()
+        s.data_dir, s.provider, s.extra_allowed_hosts = tmp_path, "gmail", ("testserver",)
+        g = G({})
+        return build_state(s, retry=retry, token_store=TokenStore(kr), reader_factory=lambda cr, st: reader(g),
+                           writer_factory=fake_writer_factory(g))
+
+    kr = FakeKeyring()
+    kr.set_password("sift-gmail", "oauth-token", creds_json())
+    st = boot(kr)
+    assert st.writer is None and st.cleanup["state"] == "disabled"
+
+    kr.set_password(WRITER_KEYRING_SERVICE, "oauth-token", creds_json(WRITER_SCOPES))
+    st = boot(kr)
+    assert isinstance(st.writer, GmailWriter) and st.cleanup["state"] == "enabled"
+    assert st.db.get_setting("cleanup.enabled_at")
+
+    # Writer token without modify: refused and deleted, reader unaffected.
+    kr.set_password(WRITER_KEYRING_SERVICE, "oauth-token", creds_json([READONLY_SCOPE]))
+    st = boot(kr)
+    assert st.writer is None and st.cleanup["state"] == "error" and st.connection["state"] == "connected"
+    assert (WRITER_KEYRING_SERVICE, "oauth-token") not in kr.store
+
+    # Writer token alone (no reader): never attached.
+    kr2 = FakeKeyring()
+    kr2.set_password(WRITER_KEYRING_SERVICE, "oauth-token", creds_json(WRITER_SCOPES))
+    st = boot(kr2)
+    assert st.writer is None and st.provider is None
+
+
+def test_startup_survives_corrupt_entries(tmp_path, retry):
+    kr = FakeKeyring()
+    kr.set_password("sift-gmail", "oauth-token", "{garbage")
+    kr.set_password(WRITER_KEYRING_SERVICE, "oauth-token", "also garbage")
+    s = Settings()
+    s.data_dir, s.provider, s.extra_allowed_hosts = tmp_path, "gmail", ("testserver",)
+    state = build_state(s, retry=retry, token_store=TokenStore(kr), reader_factory=lambda cr, st: reader(G({})))
+    assert state.provider is None and state.connection["state"] == "disconnected"
+    assert "unreadable" in state.connection["error"] and kr.store == {}
+    assert state.cleanup["state"] == "error"
+    c = TestClient(create_app(state), headers={"X-Sift": "1"})
+    st = c.get("/api/status").json()
+    assert st["can_modify"] is False and "garbage" not in json.dumps(st)
+
+
+def test_disconnect_survives_corrupt_entries(gmail_app, consent):
+    c, state, g, kr, revoked = gmail_app
+    enable(c)
+    kr.set_password("sift-gmail", "oauth-token", "{broken")
+    kr.set_password(WRITER_KEYRING_SERVICE, "oauth-token", "{broken")
+    r = c.post("/api/gmail/disconnect")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["local_token_deleted"] and d["cleanup_token_deleted"] and len(d["problems"]) == 2
+    assert kr.store == {} and state.writer is None and state.provider is None
+
+
+def test_disconnect_also_removes_writer(gmail_app, consent, monkeypatch):
+    c, state, g, kr, _ = gmail_app
+    enable(c)
+    revoked = []
+    monkeypatch.setattr("sift.api.revoke", lambda creds: revoked.append(creds) or True)
+    d = c.post("/api/gmail/disconnect").json()
+    assert d["revoked_at_google"] and d["cleanup_revoked_at_google"] and len(revoked) == 2
+    assert kr.store == {} and c.get("/api/status").json()["can_modify"] is False
+
+
+def test_reconnect_same_account_keeps_cleanup_other_account_drops_it(gmail_app, consent, monkeypatch):
+    c, state, g, kr, _ = gmail_app
+    enable(c)
+    # Reconnect the reader (same account): writer re-attached after re-checking its account.
+    consent["creds"] = FakeCreds()
+    c.post("/api/gmail/connect")
+    for _ in range(200):
+        if c.get("/api/status").json()["connection"]["state"] == "connected":
+            break
+        time.sleep(0.02)
+    time.sleep(0.05)
+    st = c.get("/api/status").json()
+    assert st["can_modify"] is True and (WRITER_KEYRING_SERVICE, "oauth-token") in kr.store
+    # Reconnect as a different account: cleanup token revoked and deleted.
+    other = G({})
+    oh = other.handle
+    other.handle = lambda kind, kw: {"emailAddress": "b@other.example"} if kind == "getProfile" else oh(kind, kw)
+    state.reader_factory = lambda creds, st: reader(other)
+    c.post("/api/gmail/connect")
+    for _ in range(200):
+        st = c.get("/api/status").json()
+        if st["connection"]["state"] == "connected" and st["account"] == "b@other.example":
+            break
+        time.sleep(0.02)
+    st = c.get("/api/status").json()
+    assert st["account"] == "b@other.example" and st["can_modify"] is False
+    assert (WRITER_KEYRING_SERVICE, "oauth-token") not in kr.store
+
+
+# --- end to end: execute and restore through GmailWriter against the fake Gmail ---------------------
+def wait_run(c, run_id):
+    for _ in range(500):
+        d = c.get(f"/api/runs/{run_id}").json()
+        if d["status"] != "running":
+            return d
+        time.sleep(0.02)
+    raise AssertionError("run timeout")
+
+
+def test_capped_run_archives_and_labels_via_gmail_writer(gmail_app, consent):
+    c, state, g, kr, _ = gmail_app
+    c.post("/api/scan")  # full scan: the executor refuses capped test scans
+    assert wait_scan(c)["status"] == "completed"
+    enable(c)
+    backdate_enable(state)
+    recs = [r for r in c.get("/api/recommendations").json()["items"] if r["action"] != "review" and r["count"]]
+    p = c.post("/api/plans", json={"items": [{"rec_id": recs[0]["id"]}]}).json()
+    c.post(f"/api/plans/{p['id']}/approve", json={"confirm_hash": p["ids_hash"]})
+    r = c.post(f"/api/plans/{p['id']}/execute")
+    assert r.status_code == 200, r.text
+    run = wait_run(c, r.json()["id"])
+    assert run["status"] in ("completed", "partial") and run["confirmed"] == 50  # first-run cap
+    label = next(l for l in g.lbls if l["name"] == run["label_name"])
+    archived = [m for m in g.msgs.values() if label["id"] in m["labelIds"]]
+    assert len(archived) == 50 and all("INBOX" not in m["labelIds"] for m in archived)
+    mods = calls(g, "messages.batchModify")
+    assert mods and all(len(kw["body"]["ids"]) <= 500 for kw in mods)
+    assert calls(g, "labels.create") and len(calls(g, "labels.create")) == 1
+    # Restore puts them back in the inbox.
+    rr = c.post(f"/api/runs/{run['id']}/restore")
+    assert rr.status_code == 200, rr.text
+    wait_run(c, rr.json()["id"])
+    assert all("INBOX" in m["labelIds"] for m in archived)
+
+
+def test_writer_expiry_mid_run_surfaces_reconnect_cleanup(gmail_app, consent):
+    c, state, g, kr, _ = gmail_app
+    c.post("/api/scan")
+    wait_scan(c)
+    enable(c)
+    backdate_enable(state)
+
+    class Expired(WriterCreds):  # the writer's refresh token died (Testing mode: 7 days); the reader's is fine
+        valid = False
+
+        def refresh(self, request):
+            raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+    state.writer._creds = Expired()
+    recs = [r for r in c.get("/api/recommendations").json()["items"] if r["action"] != "review" and r["count"]]
+    p = c.post("/api/plans", json={"items": [{"rec_id": recs[0]["id"]}]}).json()
+    c.post(f"/api/plans/{p['id']}/approve", json={"confirm_hash": p["ids_hash"]})
+    r = c.post(f"/api/plans/{p['id']}/execute")
+    run = wait_run(c, r.json()["id"])
+    assert run["status"] == "failed" and "reconnect cleanup" in (run["error"] or "")
+    st = c.get("/api/status").json()
+    assert st["cleanup"]["state"] == "reauth_required" and "reconnect cleanup" in st["cleanup"]["error"]
+    assert st["can_modify"] is False and st["connection"]["state"] == "connected"
+    assert (WRITER_KEYRING_SERVICE, "oauth-token") not in kr.store
+    assert c.post(f"/api/plans/{p['id']}/execute").status_code == 400  # no writer any more

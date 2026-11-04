@@ -378,3 +378,135 @@ def test_capped_test_scan_cannot_drive_cleanup(db, provider, scanner, executor, 
     p = approved_plan(db)
     with pytest.raises(ExecutionError, match="test scan"):
         executor.create_run(p["id"])
+
+
+# --- Phase 4 must-fix items ---------------------------------------------------------------------------
+def _sent_to(provider, mid, to, tid="t-new"):
+    with provider._conn() as c:
+        c.execute("INSERT INTO mbox VALUES (?, ?, 'you@sift-demo.test', 'You', ?, 'hello', '', 9999999999999, "
+                  "'[\"SENT\"]', NULL, NULL, NULL)", (mid, tid, f'["{to}"]'))
+
+
+def test_sender_emailed_after_scan_is_protected_at_run_time(db, provider, scanned, executor, unlocked):
+    """Item 1: mail you sent since the scan (to a sender in the plan) protects that sender's messages."""
+    p = approved_plan(db)
+    mid = plan_ids(db, p["id"])[0]
+    sender = provider.get_metadata([mid])[0].from_addr
+    _sent_to(provider, "sent-after-scan", sender.upper())
+    run(executor, p["id"])
+    assert "INBOX" in labels_of(provider, [mid])[mid]
+    with db.connect() as c:
+        reason = c.execute("SELECT reason FROM plan_messages WHERE plan_id=? AND message_id=?", (p["id"], mid)).fetchone()[0]
+    assert reason == "newly protected: sender you have emailed"
+
+
+def test_stale_scan_refused(db, scanned, executor, unlocked):
+    p = approved_plan(db)
+    with db.connect() as c:
+        c.execute("UPDATE scans SET finished_at='2020-01-01T00:00:00+00:00'")
+    with pytest.raises(ExecutionError, match="days old"):
+        executor.create_run(p["id"])
+
+
+def test_archive_skips_message_already_in_trash(db, provider, scanned, executor, unlocked):
+    """Item 2: the Trash exemption no longer lets archive touch trashed mail."""
+    p = approved_plan(db)
+    mid = plan_ids(db, p["id"])[0]
+    provider.trash(mid)
+    rid, _ = run(executor, p["id"])
+    labels = labels_of(provider, [mid])[mid]
+    assert not any(l.startswith("Label_") or l == run_row(db, rid)["label_id"] for l in labels)
+    with db.connect() as c:
+        assert c.execute("SELECT reason FROM plan_messages WHERE plan_id=? AND message_id=?",
+                         (p["id"], mid)).fetchone()[0] == "already in Trash"
+
+
+def test_only_one_capped_run_until_unlock(db, provider, scanned, executor):
+    """Item 4: a second capped run is refused until the first is restored."""
+    p = approved_plan(db)
+    rid, _ = run(executor, p["id"])
+    p2 = approved_plan(db, rec="newsletters")
+    with pytest.raises(ExecutionError, match="one capped run"):
+        executor.create_run(p2["id"])
+    assert executor.restore(executor.create_restore(rid)) == "completed"
+    p3 = approved_plan(db, rec="newsletters")
+    executor.create_run(p3["id"])  # allowed again once the first is fully restored
+
+
+def test_first_run_takes_one_recommendation(db, scanned, executor):
+    from sift.plans import PlanItem, approve_plan, create_plan
+    p = create_plan(db, [PlanItem(rec_id="promotions"), PlanItem(rec_id="newsletters")])
+    approve_plan(db, p["id"], p["ids_hash"])
+    with pytest.raises(ExecutionError, match="exactly one recommendation"):
+        executor.create_run(p["id"])
+
+
+def test_unlock_counts_unconfirmed_changes(db, provider, scanned, executor):
+    """Item 3: a run whose changes were only attempted still needs a restore before unlock."""
+    p = approved_plan(db)
+    rid, _ = run(executor, p["id"])
+    with db.connect() as c:
+        c.execute("UPDATE runs SET confirmed=0 WHERE id=?", (rid,))  # as if confirmation never happened
+    with pytest.raises(ExecutionError):
+        executor.unlock_full_runs()
+    assert executor.restore(executor.create_restore(rid)) == "completed"
+    executor.unlock_full_runs()
+
+
+def test_already_done_message_now_protected_is_flagged_and_audited(db, provider, scanned, executor, unlocked):
+    """Item 5: the idempotency shortcut audits, and flags messages that became protected."""
+    p = approved_plan(db)
+    rid, _ = run(executor, p["id"])
+    ids = plan_ids(db, p["id"])
+    with db.connect() as c:
+        c.execute("UPDATE plan_messages SET status='pending' WHERE plan_id=?", (p["id"],))  # as if never recorded
+        c.execute("UPDATE plans SET status='partial' WHERE id=?", (p["id"],))
+    _sent_to(provider, "sent-later", provider.get_metadata([ids[0]])[0].from_addr)
+    rid2, _ = run(executor, p["id"])
+    with db.connect() as c:
+        st = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM audit_log WHERE run_id=? "
+                                            "AND action='archive' GROUP BY status", (rid2,))}
+        flagged = c.execute("SELECT reason FROM plan_messages WHERE plan_id=? AND message_id=?",
+                            (p["id"], ids[0])).fetchone()[0]
+    assert st.get("already_done", 0) > 0 and st.get("attempted", 0) == 0
+    assert flagged.startswith("newly protected: sender you have emailed")
+
+
+def test_plan_approved_while_read_only_is_refused(db, scanned, executor, unlocked):
+    """Item 7."""
+    p = approved_plan(db)
+    db.set_setting("cleanup.enabled_at", "2999-01-01T00:00:00+00:00")
+    with pytest.raises(ExecutionError, match="read-only"):
+        executor.create_run(p["id"])
+
+
+def test_plan_refused_after_reanalysis(db, scanned, executor, unlocked):
+    """Item 14: a Claude run, rule change or rescan after the plan was built stops it."""
+    from sift.analysis import build_recommendations
+    from sift.classifier.rules import RuleOnlyClassifier
+    p = approved_plan(db)
+    build_recommendations(db, RuleOnlyClassifier(), None)
+    with pytest.raises(ExecutionError, match="recommendations changed"):
+        executor.create_run(p["id"])
+
+
+def test_run_and_restore_require_writer(db, provider, scanned, retry):
+    """Item 11: defence in depth even if a run row exists."""
+    from sift.executor import Executor
+    ro = Executor(db, provider, None, retry=retry)
+    with pytest.raises(ExecutionError, match="read-only"):
+        ro.run(1)
+    with pytest.raises(ExecutionError, match="read-only"):
+        ro.restore(1)
+
+
+def test_wipe_with_runs_succeeds_and_keeps_history(db, provider, scanned, executor, unlocked):
+    """Item 10: disconnect's wipe can't fail midway once runs exist."""
+    p = approved_plan(db)
+    rid, _ = run(executor, p["id"])
+    approved_plan(db, rec="newsletters")  # an approved plan that never ran
+    db.wipe_analysis()
+    with db.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 0
+        assert c.execute("SELECT COUNT(*) FROM runs WHERE id=?", (rid,)).fetchone()[0] == 1
+        assert c.execute("SELECT COUNT(*) FROM audit_log WHERE run_id=?", (rid,)).fetchone()[0] > 0

@@ -21,8 +21,9 @@ from .executor import ExecutionError, Executor, unlocked
 from .jobs import JobRunner, recover_interrupted
 from .plans import PlanError, PlanItem, approve_plan, create_plan, get_plan
 from .providers.base import MailReader, MailWriter, ProviderError
-from .providers.gmail_auth import (AuthError, ReauthRequired, TokenStore, check_scopes, credential_store_name,
-                                   revoke, run_consent_flow)
+from .providers.gmail_auth import (WRITER, AuthError, ReauthRequired, TokenStore, check_scopes,
+                                   credential_store_name, dangerous, revoke, run_consent_flow)
+from . import unsubscribe as unsub
 from .providers.mock import MockProvider
 from .protection import RULES_VERSION
 from .ai import run as ai_run
@@ -55,11 +56,33 @@ class State:
     planner: QueryPlanner | None = None
     ai_unavailable_reason: str | None = None
     connection: dict = field(default_factory=lambda: {"state": "disconnected", "error": None})
+    # Gmail cleanup (gmail.modify): a separate writer token in its own keychain entry (PROGRESS item 8).
+    writer_store: TokenStore | None = None
+    writer_factory: object = None
+    cleanup: dict = field(default_factory=lambda: {"state": "disabled", "error": None})
+    unsub_poster: object = None
 
     def attach(self, reader: MailReader | None, writer: MailWriter | None) -> None:
         self.provider, self.writer = reader, writer
         self.scanner = Scanner(self.db, reader, self.classifier, self.retry) if reader else None
         self.executor = Executor(self.db, reader, writer, self.settings.first_run_cap, self.retry)
+
+    def detach_writer(self, cleanup_state: str = "disabled", error: str | None = None) -> None:
+        """Drop write access only; the read-only connection (and any scan in progress) is untouched."""
+        self.writer = None
+        self.executor = Executor(self.db, self.provider, None, self.settings.first_run_cap, self.retry)
+        self.cleanup = {"state": cleanup_state, "error": error}
+
+    def writer_reauth(self) -> None:
+        """Called by GmailWriter when its refresh token is dead (Testing mode: 7 days) or its scopes drifted.
+        Surfaces as "reconnect cleanup"; never crashes the app."""
+        if self.writer_store is not None:
+            self.writer_store.delete()
+        self.detach_writer("reauth_required", "Cleanup permission expired; reconnect cleanup")
+
+    def make_writer(self, creds) -> MailWriter:
+        return self.writer_factory(creds, self.writer_store, getattr(self.provider, "limiter", None),
+                                   self.writer_reauth)
 
 
 class PlanItemIn(BaseModel):
@@ -104,8 +127,13 @@ class RuleIn(BaseModel):
     value: str
 
 
+class UnsubBatchIn(BaseModel):
+    senders: list[str] = Field(..., min_length=1, max_length=unsub.MAX_BATCH_SENDERS)
+
+
 def build_state(settings: Settings, provider: MailReader | None = None, retry: RetryPolicy | None = None,
-                token_store: TokenStore | None = None, reader_factory=None, ai_client=None) -> State:
+                token_store: TokenStore | None = None, reader_factory=None, ai_client=None,
+                writer_factory=None, unsub_poster=None) -> State:
     db = Database(settings.app_db)
     retry = retry or RetryPolicy(settings.max_attempts, settings.backoff_base, settings.backoff_max)
     classifier = RuleOnlyClassifier()
@@ -123,16 +151,47 @@ def build_state(settings: Settings, provider: MailReader | None = None, retry: R
     if settings.provider != "gmail":
         raise RuntimeError(f"unknown provider {settings.provider!r}")
     state.token_store = token_store or TokenStore()
+    state.writer_store = state.token_store.for_writer()
     state.reader_factory = reader_factory or _gmail_reader
-    creds = state.token_store.load()
+    state.writer_factory = writer_factory or _gmail_writer
+    state.unsub_poster = unsub_poster
+    # A corrupt keychain entry is treated as missing: deleted and reported, never a startup crash (item 12).
+    creds, problem = state.token_store.load_or_discard()
+    if problem:
+        state.connection = {"state": "disconnected", "error": problem}
     if creds is not None:
         try:
             check_scopes(creds)
-            state.attach(state.reader_factory(creds, state.token_store), None)  # read-only: no writer
+            state.attach(state.reader_factory(creds, state.token_store), None)  # read-only until the writer loads
             state.connection = {"state": "connected", "error": None}
         except AuthError as e:
             state.connection = {"state": "error", "error": str(e)}
+    _load_writer(state)
     return state
+
+
+def _load_writer(state: State) -> None:
+    """Attach the cleanup writer at startup only if the reader is connected and the writer token exists and
+    carries exactly the allowed scopes. A bad token is deleted (and revoked if it carries scopes Sift never
+    asks for). No network call here: a dead refresh token surfaces on first use as "reconnect cleanup"."""
+    wcreds, problem = state.writer_store.load_or_discard()
+    if problem:
+        state.cleanup = {"state": "error", "error": problem.replace("Google sign-in", "cleanup permission")}
+        return
+    if wcreds is None or state.provider is None or state.connection["state"] != "connected":
+        return  # a writer without a working reader stays stored but unused; disconnect deletes it
+    try:
+        check_scopes(wcreds, WRITER)
+    except AuthError as e:
+        if dangerous(wcreds):
+            revoke(wcreds)
+        state.writer_store.delete()
+        state.cleanup = {"state": "error", "error": f"{e}. The cleanup token was removed; enable cleanup again."}
+        return
+    state.attach(state.provider, state.make_writer(wcreds))
+    state.cleanup = {"state": "enabled", "error": None}
+    if not state.db.get_setting("cleanup.enabled_at"):
+        state.db.set_setting("cleanup.enabled_at", now_iso())  # unknown grant time: earlier approvals are void
 
 
 def public_error(e: Exception) -> str:
@@ -166,6 +225,12 @@ def _attach_ai(state: State, client=None) -> None:
 def _gmail_reader(creds, store):
     from .providers.gmail import GmailReader
     return GmailReader(creds, store)
+
+
+def _gmail_writer(creds, store, limiter, on_reauth):
+    # Shares the reader's QuotaLimiter: Gmail's 6,000 units/minute is per user, not per token.
+    from .providers.gmail_writer import GmailWriter
+    return GmailWriter(creds, store, limiter=limiter, on_reauth=on_reauth)
 
 
 def _ms_to_iso(ms):
@@ -238,11 +303,20 @@ def create_app(state: State) -> FastAPI:
             mode = "synthetic mailbox: approved plans change synthetic data only"
         elif state.writer is None:
             mode = "read-only (gmail.readonly): Sift cannot change your mail"
+            if state.cleanup["state"] == "reauth_required":
+                mode += ". Cleanup permission expired: reconnect cleanup"
         else:
-            mode = "cleanup enabled (gmail.modify)"
+            mode = "cleanup enabled (gmail.modify): changes still need an approved plan"
+        # Reported from what is actually attached, so it can't claim write access Sift doesn't hold.
+        if synthetic or state.writer is not None:
+            cleanup = {"state": "enabled", "error": None}
+        elif state.cleanup["state"] == "enabled":
+            cleanup = {"state": "disabled", "error": None}
+        else:
+            cleanup = dict(state.cleanup)
         return {**s, "account": account(), "provider_name": p.name if p else s["provider"],
                 "synthetic": synthetic, "connection": state.connection,
-                "can_modify": state.writer is not None,
+                "can_modify": state.writer is not None, "cleanup": cleanup,
                 "credential_store": credential_store_name() if state.token_store else None,
                 "classifier": classifier_info(),
                 "ai": {"available": state.claude is not None, "reason": state.ai_unavailable_reason},
@@ -263,7 +337,7 @@ def create_app(state: State) -> FastAPI:
         def flow():
             try:
                 creds = run_consent_flow(state.settings.client_secrets)
-                old = state.token_store.load()
+                old, _ = state.token_store.load_or_discard()
                 previous = db.get_setting("account.email")
                 reader = state.reader_factory(creds, state.token_store)
                 new_email = reader.account_email()
@@ -276,8 +350,9 @@ def create_app(state: State) -> FastAPI:
                 if switched and old is not None:
                     # Only for a different account: revoking the same account's grant would kill the new token.
                     revoke(old)
-                state.attach(reader, None)  # read-only, no writer
+                state.attach(reader, None)  # read-only; the writer is re-attached below only for the same account
                 db.set_setting("account.email", new_email)
+                _reattach_writer(new_email, switched)
                 state.connection = {"state": "connected", "error": None}
             except Exception as e:  # message only, never tokens
                 log.warning("gmail connect failed: %s", type(e).__name__)
@@ -290,20 +365,190 @@ def create_app(state: State) -> FastAPI:
             threading.Thread(target=flow, name="sift-oauth", daemon=True).start()
         return status()
 
+    def _drop_writer_token() -> tuple[bool, bool, str | None]:
+        """Revoke and delete the stored writer token. Returns (revoked_at_google, deleted, problem)."""
+        wcreds, problem = state.writer_store.load_or_discard()
+        revoked = revoke(wcreds) if wcreds else False
+        return revoked, state.writer_store.delete(), problem
+
+    def _candidate_writer(creds) -> MailWriter:
+        """A writer used only to check which account a new/stored cleanup token belongs to. It has no reauth
+        hook, so a failure here can't delete or detach the cleanup token that is currently in use."""
+        return state.writer_factory(creds, state.writer_store, getattr(state.provider, "limiter", None), None)
+
+    def _reattach_writer(email: str, switched: bool) -> None:
+        """After a (re)connect: keep cleanup only if its token belongs to this same account."""
+        if switched:
+            _drop_writer_token()
+            state.detach_writer()
+            return
+        wcreds, problem = state.writer_store.load_or_discard()
+        if wcreds is None:
+            state.detach_writer("error" if problem else "disabled", problem)
+            return
+        try:
+            check_scopes(wcreds, WRITER)
+            if _candidate_writer(wcreds).account_email() != email:
+                raise AuthError("cleanup token belongs to another account")
+        except ReauthRequired:
+            state.writer_store.delete()
+            state.detach_writer("reauth_required", "Cleanup permission expired; reconnect cleanup")
+            return
+        except (AuthError, ProviderError):
+            revoke(wcreds)
+            state.writer_store.delete()
+            state.detach_writer("disabled")
+            return
+        state.attach(state.provider, state.make_writer(wcreds))
+        state.cleanup = {"state": "enabled", "error": None}
+
     @app.post("/api/gmail/disconnect")
     def gmail_disconnect():
         if state.token_store is None:
             bad("not running in Gmail mode", 404)
         if state.jobs.busy():
             bad("wait for the current job to finish (or cancel it) before disconnecting", 409)
-        creds = state.token_store.load()
+        # Never let an unreadable keychain entry stop a disconnect (item 12): it is deleted and reported.
+        creds, problem = state.token_store.load_or_discard()
         revoked = revoke(creds) if creds else False
-        state.token_store.delete()
+        deleted = state.token_store.delete()
+        w_revoked, w_deleted, w_problem = _drop_writer_token()
         state.attach(None, None)
+        state.cleanup = {"state": "disabled", "error": None}
         db.wipe_analysis()  # scanned metadata from this account; the audit log is kept
+        unsub.discard_batches(db)  # they hold one-click URLs; the unsubscribe log is kept
         db.set_setting("account.email", None)
         state.connection = {"state": "disconnected", "error": None}
-        return {"revoked_at_google": revoked, "local_token_deleted": True, "local_metadata_deleted": True}
+        return {"revoked_at_google": revoked, "local_token_deleted": deleted, "local_metadata_deleted": True,
+                "cleanup_revoked_at_google": w_revoked, "cleanup_token_deleted": w_deleted,
+                "problems": [p for p in (problem, w_problem) if p]}
+
+    # -- Gmail cleanup (gmail.modify) -----------------------------------------
+    cleanup_lock = threading.Lock()
+
+    @app.post("/api/cleanup/enable")
+    def cleanup_enable():
+        """Start the separate "Enable cleanup" consent (gmail.modify). Runs in the background like connect;
+        poll /api/status -> cleanup.state (enabling | enabled | error)."""
+        if state.token_store is None:
+            bad("not running in Gmail mode (the synthetic mailbox needs no permission)", 404)
+        if state.provider is None or state.connection["state"] != "connected":
+            bad("connect Gmail (read-only) first", 409)
+        if not state.settings.client_secrets.exists():
+            bad(f"OAuth client file not found at {state.settings.client_secrets}. See docs/google-setup.md.")
+        if state.jobs.busy():
+            bad("wait for the current job to finish before enabling cleanup", 409)
+        expected = account()
+        if not expected:
+            bad("could not confirm which account is connected; reconnect Gmail", 409)
+
+        def flow():
+            try:
+                creds = run_consent_flow(state.settings.client_secrets, role=WRITER)  # refuses+revokes bad scopes
+                got = _candidate_writer(creds).account_email()
+                if got != expected:
+                    revoke(creds)
+                    raise AuthError("You approved cleanup for a different Google account than the one connected. "
+                                    "Nothing was saved; enable cleanup again with the connected account.")
+                state.writer_store.save(creds)
+                state.attach(state.provider, state.make_writer(creds))
+                db.set_setting("cleanup.enabled_at", now_iso())  # plans approved before this need re-approval
+                state.cleanup = {"state": "enabled", "error": None}
+            except Exception as e:  # message only, never tokens
+                log.warning("enable cleanup failed: %s", type(e).__name__)
+                state.cleanup = {"state": "error", "error": public_error(e)}
+
+        with cleanup_lock:
+            if state.cleanup["state"] == "enabling":
+                return status()
+            state.cleanup = {"state": "enabling", "error": None}
+            threading.Thread(target=flow, name="sift-oauth-cleanup", daemon=True).start()
+        return status()
+
+    @app.post("/api/cleanup/disable")
+    def cleanup_disable():
+        """Revoke and delete only the writer token. The read-only connection stays."""
+        if state.token_store is None:
+            bad("not running in Gmail mode", 404)
+        if state.jobs.busy():
+            bad("wait for the current job to finish (or cancel it) before disabling cleanup", 409)
+        revoked, deleted, problem = _drop_writer_token()
+        state.detach_writer()
+        return {"revoked_at_google": revoked, "local_writer_token_deleted": deleted,
+                "problems": [problem] if problem else [],
+                "note": "Google may end Sift's read-only sign-in too when a grant is revoked. "
+                        "If so, Sift will ask you to reconnect Gmail.", "status": status()}
+
+    # -- unsubscribe (RFC 8058 one-click, separate approval per batch) --------
+    def need_cleanup():
+        if state.writer is None:
+            bad("enable cleanup first: unsubscribing needs the same explicit permission as changing mail", 409)
+
+    def _poster():
+        if state.provider is not None and state.provider.synthetic:
+            return unsub.SimulatedPoster()  # synthetic senders: never contact a real host
+        return state.unsub_poster or unsub.OneClickPoster()
+
+    def _unsub(fn, *a):
+        try:
+            return fn(*a)
+        except unsub.UnsubscribeError as e:
+            bad(e)
+
+    @app.post("/api/unsubscribe/batches")
+    def unsub_create(body: UnsubBatchIn):
+        """Freeze the chosen sender groups into a batch. Sends nothing."""
+        reader = need_reader()
+        need_cleanup()
+        user = account() or reader.account_email()
+        try:
+            return unsub.create_batch(db, reader, body.senders, user)
+        except unsub.UnsubscribeError as e:
+            bad(e)
+        except ProviderError as e:
+            bad(public_error(e), 502)
+
+    @app.get("/api/unsubscribe/batches/{batch_id}")
+    def unsub_get(batch_id: int):
+        try:
+            return unsub.get_batch(db, batch_id)
+        except unsub.UnsubscribeError as e:
+            bad(e, 404)
+
+    @app.post("/api/unsubscribe/batches/{batch_id}/approve")
+    def unsub_approve(batch_id: int, body: ApproveIn):
+        need_cleanup()
+        return _unsub(unsub.approve_batch, db, batch_id, body.confirm_hash)
+
+    @app.post("/api/unsubscribe/batches/{batch_id}/cancel")
+    def unsub_cancel(batch_id: int):
+        return _unsub(unsub.cancel_batch, db, batch_id)
+
+    @app.post("/api/unsubscribe/batches/{batch_id}/execute")
+    def unsub_execute(batch_id: int):
+        need_cleanup()
+        if state.jobs.busy():
+            bad("another job is running", 409)
+        synthetic = bool(state.provider and state.provider.synthetic)
+        # Gmail: the batch must have been approved after cleanup was last enabled. Synthetic: no grant exists.
+        enabled_at = "" if synthetic else db.get_setting("cleanup.enabled_at")
+        _unsub(unsub.start_batch, db, batch_id, enabled_at)
+        poster = _poster()
+
+        def crash(msg):
+            with db.connect() as c:
+                c.execute("UPDATE unsubscribe_batches SET status='failed', error=?, finished_at=? "
+                          "WHERE id=? AND status='running'", ("stopped unexpectedly", now_iso(), batch_id))
+
+        state.jobs.submit("unsubscribe", lambda: unsub.run_batch(db, batch_id, poster), crash)
+        return unsub.get_batch(db, batch_id)
+
+    @app.get("/api/unsubscribe/log")
+    def unsub_log(limit: int = 200):
+        with db.connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT ts, batch_id, sender, method, url_host, status_code, outcome, detail FROM unsubscribe_log "
+                "ORDER BY id DESC LIMIT ?", (max(1, min(limit, 1000)),))]
 
     @app.get("/api/dashboard")
     def dashboard():
@@ -696,6 +941,10 @@ def create_app(state: State) -> FastAPI:
                     "SELECT COUNT(*) FROM plan_messages WHERE plan_id=? AND status IN ('pending','failed')",
                     (d["plan_id"],)).fetchone()[0]
             d["inbox_now"] = c.execute("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1").fetchone()[0]
+            # Restore covers every change the run attempted (write-ahead rows), not just the confirmed ones.
+            d["restorable"] = c.execute(
+                "SELECT COUNT(DISTINCT message_id) FROM audit_log WHERE run_id=? AND action IN ('archive','trash') "
+                "AND status='attempted'", (run_id,)).fetchone()[0]
             d["restores"] = [dict(x) for x in c.execute(
                 "SELECT id, status, confirmed, failed FROM runs WHERE source_run_id=? ORDER BY id", (run_id,))]
         return d

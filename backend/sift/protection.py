@@ -97,7 +97,12 @@ def load_context(db, user_email: str) -> ProtectionContext:
         by_name.setdefault(name.lower(), set()).add(lid)
     for kind, value in rules:
         if kind == "label":
-            ctx.protected_labels |= by_name.get(value.lower(), set()) | {value}
+            v = value.lower().strip("/")
+            # "Work" also protects nested labels such as "Work/Clients".
+            for name, lids in by_name.items():
+                if name == v or name.startswith(v + "/"):
+                    ctx.protected_labels |= lids
+            ctx.protected_labels.add(value)
         elif kind == "sender":
             ctx.protected_senders.add(value.lower())
         else:

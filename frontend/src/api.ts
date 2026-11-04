@@ -217,4 +217,5 @@ export interface Run {
   plan_remaining?: number;
   inbox_now: number;
   restores: { id: number; status: string; confirmed: number; failed: number }[];
+  restorable: number; // messages this run attempted to change (confirmed or not)
 }

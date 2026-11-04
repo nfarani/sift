@@ -95,3 +95,13 @@ def test_trip_receipts_and_portuguese_transactional_subjects(subject):
 ])
 def test_promos_from_receipt_senders_stay_unprotected(subject):
     assert reason(subject=subject) is None
+
+
+def test_label_rule_covers_nested_labels(db):
+    """Item 9: a rule for "Work" also protects "Work/Clients"."""
+    from sift.protection import load_context
+    db.set_setting("labels.map", {"Label_1": "Work", "Label_2": "Work/Clients", "Label_3": "Workshop"})
+    with db.connect() as c:
+        c.execute("INSERT INTO protection_rules(kind, value, created_at) VALUES ('label', 'Work', 't')")
+    ctx = load_context(db, ME)
+    assert {"Label_1", "Label_2"} <= ctx.protected_labels and "Label_3" not in ctx.protected_labels

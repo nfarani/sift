@@ -61,7 +61,8 @@ def test_frozen_plan_rejects_scope_changes(db, scanned):
 
 def test_executor_refuses_tampered_plan(db, scanned, executor):
     p = approved_plan(db)
-    with db.connect() as c:  # bypass triggers by deleting a row: hash no longer matches
+    with db.connect() as c:  # bypass the triggers by dropping one: the hash check is the backstop
+        c.execute("DROP TRIGGER plan_messages_no_delete")
         c.execute("DELETE FROM plan_messages WHERE plan_id=? AND message_id=?", (p["id"], plan_ids(db, p["id"])[0]))
     with pytest.raises(ExecutionError, match="changed after approval"):
         executor.create_run(p["id"])
@@ -102,3 +103,17 @@ def test_approved_plan_fields_and_status_are_frozen(db, scanned):
                      "UPDATE plans SET total=1 WHERE id=?", "UPDATE plans SET status='draft' WHERE id=?"):
             with pytest.raises(sqlite3.IntegrityError, match="frozen"):
                 c.execute(stmt, (p["id"],))
+
+
+def test_frozen_plan_rows_cannot_be_deleted_or_reapproved(db, scanned):
+    import sqlite3
+    p = approved_plan(db)
+    with db.connect() as c:
+        with pytest.raises(sqlite3.IntegrityError):
+            c.execute("DELETE FROM plan_messages WHERE plan_id=?", (p["id"],))
+        c.execute("UPDATE plans SET status='cancelled' WHERE id=?", (p["id"],))
+        for back in ("approved", "running", "partial"):
+            with pytest.raises(sqlite3.IntegrityError):
+                c.execute("UPDATE plans SET status=? WHERE id=?", (back, p["id"]))
+        with pytest.raises(sqlite3.IntegrityError):
+            c.execute("UPDATE plans SET analysis_gen=999 WHERE id=?", (p["id"],))

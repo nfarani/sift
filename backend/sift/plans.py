@@ -105,6 +105,7 @@ def create_plan(db: Database, items: list[PlanItem]) -> dict:
             rows += [(mid, it.rec_id, it.action) for mid in ids]
             per_item.append({"rec_id": it.rec_id, "action": it.action, "older_than_days": it.older_than_days,
                              "cutoff_ms": cutoff, "excluded_senders": sorted(s.lower() for s in it.excluded_senders),
+                             "unread_only": bool(spec and getattr(spec, "unread_only", False)),
                              "count": len(ids), **info})
         if not rows:
             raise PlanError("nothing matches: every message is protected, excluded or too recent")
@@ -118,9 +119,12 @@ def create_plan(db: Database, items: list[PlanItem]) -> dict:
             "too_recent": sum(p["too_recent"] for p in per_item),
         }
         c.execute("UPDATE plans SET status='superseded' WHERE status='draft'")
+        gen = c.execute("SELECT value FROM settings WHERE key='analysis.generation'").fetchone()
         cur = c.execute(
-            "INSERT INTO plans(status,created_at,spec,total,ids_hash,summary,inbox_before) VALUES ('draft',?,?,?,?,?,?)",
-            (now_iso(), json.dumps(per_item), len(rows), digest, json.dumps(summary), inbox_before))
+            "INSERT INTO plans(status,created_at,spec,total,ids_hash,summary,inbox_before,analysis_gen) "
+            "VALUES ('draft',?,?,?,?,?,?,?)",
+            (now_iso(), json.dumps(per_item), len(rows), digest, json.dumps(summary), inbox_before,
+             int(json.loads(gen[0])) if gen else 0))
         pid = cur.lastrowid
         c.executemany("INSERT INTO plan_messages(plan_id,message_id,rec_id,action) VALUES (?,?,?,?)",
                       [(pid, m, r, a) for m, r, a in rows])

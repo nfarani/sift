@@ -22,6 +22,20 @@ Or do it manually: `git init`, then run `claude` and type `/phase-1`.
 
 `./start.sh --gmail` connects your real Gmail **read-only** (setup: `docs/google-setup.md`); `./start.sh --mock` or the default uses the synthetic mailbox. The two never share a database.
 
+### Gmail scopes and tokens
+| Token (macOS Keychain service) | Scope | Created when | Used by |
+|---|---|---|---|
+| `sift-gmail` | `gmail.readonly` | **Connect Gmail** | scanner, analysis, executor revalidation |
+| `sift-gmail-writer` | `gmail.modify` (+ `gmail.readonly`) | **Enable cleanup**, a separate consent you trigger | the executor only |
+
+- Sift never requests the full-access Gmail scope or any send/compose scope. A token carrying anything else is refused and revoked. Scopes are re-checked after every token refresh.
+- `gmail.modify` lets Sift archive, label and move to Trash. It can't permanently delete. Google's consent screen describes it as "Read, compose, and send emails". Sift has no code that sends or drafts mail, and the guardrail hook blocks adding any.
+- Enabling cleanup changes nothing by itself. Every change still needs an approved plan, and plans approved before cleanup was enabled have to be approved again.
+- **Disable cleanup** revokes and deletes only the writer token. Google ties both Sift tokens to one grant, so revoking may end the read-only sign-in too. If that happens, Sift shows **Reconnect Gmail**.
+- **Testing mode:** Google expires refresh tokens after 7 days. When the read-only token expires, Sift shows **Reconnect Gmail**. When the cleanup token expires, it shows **Reconnect cleanup**. Neither crashes the app.
+- An unreadable Keychain entry is treated as missing: Sift deletes it and tells you.
+- **Unsubscribe** needs cleanup enabled plus its own approval for each batch. Only RFC 8058 one-click is used: a single HTTPS POST, no redirects followed, no cookies, and nothing sent to private or local addresses. `mailto:` unsubscribes are shown as manual and never sent. Every attempt is logged with the sender, URL host and status code.
+
 By default the app runs against a **synthetic mailbox** of ~45,000 fictional messages (`data/mock_mailbox.sqlite`),
 badged "Synthetic data" everywhere. Classification is **rules only, no AI** until Phase 3.
 
@@ -39,6 +53,10 @@ backend/sift/
   classifier/           Classifier interface + RuleOnlyClassifier
   plans.py              frozen plans (exact ids + hash, DB triggers block changes)
   executor.py           the only module that modifies mail: revalidate, batch, confirm, audit, restore
+  providers/gmail.py    GmailReader (gmail.readonly, metadata only)
+  providers/gmail_writer.py  GmailWriter (gmail.modify: label, batchModify, trash/untrash; executor only)
+  providers/gmail_auth.py    OAuth loopback flow, separate reader/writer Keychain tokens, scope checks
+  unsubscribe.py        RFC 8058 one-click parsing, frozen batches, SSRF-safe single POST, append-only log
   api.py                FastAPI routes the UI reads from
 frontend/src/           React + TS + Vite UI
 ```

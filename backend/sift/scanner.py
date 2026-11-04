@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 
+from .unsubscribe import classify as classify_unsub
 from .analysis import run_analysis
 from .classifier.base import Classifier
 from .db import Database, now_iso
@@ -29,8 +30,7 @@ def _row(m: MessageMeta, user_email: str, scan_id: int) -> tuple:
     labels = m.labels
     return (m.id, m.thread_id, m.from_addr.lower(), m.from_name, m.from_domain, ",".join(a.lower() for a in m.to_addrs),
             m.subject, m.snippet[:200], m.internal_date, json.dumps(labels), m.list_id, m.list_unsubscribe,
-            1 if (m.list_unsubscribe_post and "one-click" in m.list_unsubscribe_post.lower()
-                  and "https://" in (m.list_unsubscribe or "")) else 0,
+            1 if classify_unsub(m.list_unsubscribe, m.list_unsubscribe_post).kind == "one_click" else 0,  # exact RFC 8058
             1 if ("SENT" in labels or m.from_addr.lower() == user_email.lower()) else 0,
             1 if "INBOX" in labels else 0, 1 if "UNREAD" in labels else 0, scan_id)
 

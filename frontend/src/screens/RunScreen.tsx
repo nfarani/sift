@@ -105,7 +105,7 @@ function Results({ run, status, onRestore, onUnlock, onContinue, go }: {
         <ul className="log">{run.failures.map((f) => <li key={f.message_id}>{f.message_id}: {f.detail}</li>)}</ul>
       )}
       <div className="row end">
-        {!isRestore && run.confirmed > 0 && !restored && <button className="btn btn-ghost" onClick={onRestore}>Restore these {n(run.confirmed)} messages</button>}
+        {!isRestore && run.restorable > 0 && !restored && <button className="btn btn-ghost" onClick={onRestore}>Restore these {n(run.restorable)} messages</button>}
         {canUnlock && <button className="btn btn-primary" onClick={onUnlock}>Restore verified · unlock full runs</button>}
         {status?.full_runs_unlocked && run.plan?.status === "partial" && (run.plan_remaining ?? 0) > 0 && <button className="btn btn-primary" onClick={onContinue}>Run the remaining {n(run.plan_remaining)} in plan #{run.plan_id}</button>}
         {status?.full_runs_unlocked && isRestore && !(run.plan?.status === "partial" && (run.plan_remaining ?? 0) > 0) && <button className="btn btn-ghost" onClick={() => go("recommendations")}>Back to recommendations</button>}

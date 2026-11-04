@@ -116,6 +116,8 @@ def classify(db: Database, classifier: Classifier, groups: list[SenderGroup]) ->
 
 
 def build_recommendations(db: Database, classifier: Classifier, scan_id: int | None) -> None:
+    # Any rebuild (scan, rule change, Claude run) invalidates plans built from the previous analysis.
+    db.set_setting("analysis.generation", int(db.get_setting("analysis.generation", 0) or 0) + 1)
     with db.connect() as c:
         rows = c.execute(
             "SELECT category, SUM(total) n, SUM(total*confidence)/SUM(total) conf, "

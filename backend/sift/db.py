@@ -190,6 +190,23 @@ BEFORE UPDATE OF status ON plans
 WHEN NEW.status = 'draft' AND OLD.status IS NOT 'draft'
 BEGIN SELECT RAISE(ABORT, 'plan is frozen: cannot return to draft'); END;
 
+-- Approval happens once, from draft. Cancelled and superseded plans are final (superseding is the only exit).
+CREATE TRIGGER IF NOT EXISTS plans_no_reapprove
+BEFORE UPDATE OF status ON plans
+WHEN NEW.status = 'approved' AND OLD.status IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'plan is frozen: only a draft can be approved'); END;
+
+CREATE TRIGGER IF NOT EXISTS plans_final_states
+BEFORE UPDATE OF status ON plans
+WHEN OLD.status IN ('cancelled', 'superseded') AND NEW.status NOT IN ('cancelled', 'superseded')
+BEGIN SELECT RAISE(ABORT, 'plan is final: build a new plan'); END;
+
+-- A plan's message list can only shrink while it is a draft (or once it is superseded and final).
+CREATE TRIGGER IF NOT EXISTS plan_messages_no_delete
+BEFORE DELETE ON plan_messages
+WHEN (SELECT status FROM plans WHERE id = OLD.plan_id) NOT IN ('draft', 'superseded')
+BEGIN SELECT RAISE(ABORT, 'plan is frozen: cannot remove messages'); END;
+
 CREATE TABLE IF NOT EXISTS runs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     kind             TEXT NOT NULL,           -- execute | restore
@@ -231,6 +248,42 @@ CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+
+-- Unsubscribe (RFC 8058 one-click). A batch is frozen at creation and needs its own approval.
+CREATE TABLE IF NOT EXISTS unsubscribe_batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    status      TEXT NOT NULL,               -- draft | approved | running | completed | failed | cancelled
+    created_at  TEXT NOT NULL,
+    approved_at TEXT,
+    started_at  TEXT,
+    finished_at TEXT,
+    items       TEXT NOT NULL,               -- frozen JSON list (sender, method, url, host, mailto, reason)
+    items_hash  TEXT NOT NULL,
+    error       TEXT
+);
+CREATE TRIGGER IF NOT EXISTS unsub_batch_frozen BEFORE UPDATE OF items, items_hash ON unsubscribe_batches
+BEGIN SELECT RAISE(ABORT, 'unsubscribe batch is frozen'); END;
+CREATE TRIGGER IF NOT EXISTS unsub_batch_no_reapprove BEFORE UPDATE OF status ON unsubscribe_batches
+WHEN NEW.status IN ('draft', 'approved') AND OLD.status NOT IN ('draft')
+BEGIN SELECT RAISE(ABORT, 'unsubscribe batch cannot return to draft or be re-approved'); END;
+
+-- Append-only log of every unsubscribe attempt. URL host only, never the full URL.
+CREATE TABLE IF NOT EXISTS unsubscribe_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    batch_id    INTEGER,
+    sender      TEXT NOT NULL,
+    method      TEXT NOT NULL,               -- one_click | manual
+    url_host    TEXT,
+    status_code INTEGER,
+    outcome     TEXT NOT NULL,               -- attempted | confirmed | not_confirmed | failed | refused | simulated | manual
+    detail      TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_unsub_log_batch ON unsubscribe_log(batch_id);
+CREATE TRIGGER IF NOT EXISTS unsub_log_no_update BEFORE UPDATE ON unsubscribe_log
+BEGIN SELECT RAISE(ABORT, 'unsubscribe_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS unsub_log_no_delete BEFORE DELETE ON unsubscribe_log
+BEGIN SELECT RAISE(ABORT, 'unsubscribe_log is append-only'); END;
 """
 
 
@@ -253,11 +306,15 @@ class Database:
             ("scans", (("max_per_phase", "INTEGER"), ("rate_mps", "REAL"), ("eta_s", "REAL"))),
             # spec: JSON filter for natural-language (custom) recommendations; source: rules | claude | query
             ("recommendations", (("spec", "TEXT"), ("source", "TEXT"))),
+            ("plans", (("analysis_gen", "INTEGER"),)),
         ):
             cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
             for name, decl in adds:
                 if name not in cols:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # The analysis a plan was built from is part of what was approved.
+        c.execute("CREATE TRIGGER IF NOT EXISTS plans_frozen_analysis_gen BEFORE UPDATE OF analysis_gen ON plans "
+                  "BEGIN SELECT RAISE(ABORT, 'plan is frozen: cannot change its analysis generation'); END")
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -305,6 +362,8 @@ class Database:
         """Clear scanned data, plans and Claude labels (mock reset, disconnect, account switch).
         The audit log and the spend ledger (tokens and cost only) are kept."""
         with self.tx() as c:
+            # Plans must be final before their message lists may go; runs and the audit log stay as history.
+            c.execute("UPDATE plans SET status='superseded' WHERE status NOT IN ('superseded')")
             for t in ("plan_messages", "plans", "recommendations", "sender_groups", "messages", "scans",
                       "ai_labels", "ai_runs"):
                 c.execute(f"DELETE FROM {t}")

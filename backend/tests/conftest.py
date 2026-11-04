@@ -17,7 +17,10 @@ class Sleeps(list):
 @pytest.fixture(autouse=True)
 def no_real_anthropic_key(monkeypatch):
     """sift.config loads the repo .env; tests must never see (or spend on) the real key."""
+    import os
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for k in [k for k in os.environ if k.startswith("SIFT_")]:  # nor any other local .env setting
+        monkeypatch.delenv(k, raising=False)
 
 
 @pytest.fixture
