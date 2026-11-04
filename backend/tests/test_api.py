@@ -192,3 +192,23 @@ def test_interrupted_ai_run_is_marked_failed_on_restart(db):
     recover_interrupted(db)
     with db.connect() as c:
         assert tuple(c.execute("SELECT status, error FROM ai_runs").fetchone()) == ("failed", "interrupted by restart")
+
+
+def test_report_counts_runs_restores_and_duration(client):
+    c, state = client
+    c.post("/api/scan")
+    wait(c, "/api/scan")
+    rec = next(r for r in c.get("/api/recommendations").json()["items"] if r["action"] == "archive")
+    p = c.post("/api/plans", json={"items": [{"rec_id": rec["id"]}]}).json()
+    c.post(f"/api/plans/{p['id']}/approve", json={"confirm_hash": p["ids_hash"]})
+    run = c.post(f"/api/plans/{p['id']}/execute").json()
+    wait(c, f"/api/runs/{run['id']}")
+    rep = c.get("/api/report").json()
+    assert rep["totals"]["archived_confirmed"] == 50 and rep["totals"]["attempted"] == 50
+    assert rep["inbox_before"] - rep["inbox_now"] == 50
+    assert rep["runs"][0]["duration_s"] is not None and rep["totals"]["failed"] == 0
+    rs = c.post(f"/api/runs/{run['id']}/restore").json()
+    wait(c, f"/api/runs/{rs['id']}")
+    rep = c.get("/api/report").json()
+    assert rep["totals"]["restored_confirmed"] == 50 and rep["inbox_before"] == rep["inbox_now"]
+    assert set(rep["unsubscribe"]) >= {"attempted", "accepted", "manual"}

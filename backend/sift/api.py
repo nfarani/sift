@@ -17,6 +17,7 @@ from .classifier.base import CATEGORIES, KEEP, Classifier
 from .classifier.rules import RuleOnlyClassifier
 from .config import Settings
 from .db import Database, now_iso
+from .demo import DemoMiddleware, Masker
 from .executor import ExecutionError, Executor, unlocked
 from .jobs import JobRunner, recover_interrupted
 from .plans import PlanError, PlanItem, approve_plan, create_plan, get_plan
@@ -120,6 +121,10 @@ class QueryIn(BaseModel):
 
 class SpecIn(BaseModel):
     spec: dict
+
+
+class DemoIn(BaseModel):
+    enabled: bool
 
 
 class RuleIn(BaseModel):
@@ -267,6 +272,29 @@ def create_app(state: State) -> FastAPI:
             bad("Gmail is not connected", 409)
         return state.provider
 
+    # -- demo mode (PII masking for recordings) --------------------------------
+    masker = Masker()
+    vocab = {"at": 0.0}
+
+    def demo_on() -> bool:
+        v = db.get_setting("demo.mode")
+        return state.settings.demo_mode if v is None else bool(v)
+
+    def refresh_vocab():
+        if time.time() - vocab["at"] < 30:
+            return
+        vocab["at"] = time.time()
+        with db.connect() as c:
+            names = [r[0] for r in c.execute("SELECT DISTINCT display_name FROM sender_groups WHERE display_name LIKE '% %'")]
+        masker.learn(db.get_setting("account.email") or (state.provider.account_email() if state.provider and
+                                                          state.provider.synthetic else None), names)
+
+    @app.post("/api/demo")
+    def set_demo(body: DemoIn):
+        db.set_setting("demo.mode", body.enabled)
+        vocab["at"] = 0.0
+        return {"demo_mode": demo_on()}
+
     def account() -> str | None:
         """Connected account address. Cached locally so status checks don't spend Gmail quota."""
         if state.provider is None:
@@ -314,6 +342,7 @@ def create_app(state: State) -> FastAPI:
             cleanup = {"state": "disabled", "error": None}
         else:
             cleanup = dict(state.cleanup)
+        s["demo_mode"] = demo_on()
         return {**s, "account": account(), "provider_name": p.name if p else s["provider"],
                 "synthetic": synthetic, "connection": state.connection,
                 "can_modify": state.writer is not None, "cleanup": cleanup,
@@ -916,6 +945,58 @@ def create_app(state: State) -> FastAPI:
                 c.execute("UPDATE plans SET status='partial' WHERE status='running'")
         return f
 
+    @app.get("/api/report")
+    def report():
+        """Before/after summary of everything Sift changed, from the runs table and the audit log."""
+        def secs(a, b):
+            if not (a and b):
+                return None
+            from datetime import datetime
+            return round((datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds(), 1)
+
+        with db.connect() as c:
+            runs = []
+            for r in c.execute("SELECT * FROM runs ORDER BY id"):
+                d = {k: r[k] for k in ("id", "kind", "plan_id", "source_run_id", "status", "label_name", "started_at",
+                                       "finished_at", "total", "attempted", "confirmed", "failed", "skipped",
+                                       "already_done", "error")}
+                d["duration_s"] = secs(r["started_at"], r["finished_at"])
+                d["by_action"] = {a[0]: a[1] for a in c.execute(
+                    "SELECT action, COUNT(DISTINCT message_id) FROM audit_log WHERE run_id=? AND status='confirmed' "
+                    "AND message_id IS NOT NULL GROUP BY action", (r["id"],))}
+                p = c.execute("SELECT inbox_before FROM plans WHERE id=?", (r["plan_id"],)).fetchone() if r["plan_id"] else None
+                d["inbox_before"] = p[0] if p else None
+                runs.append(d)
+            ex = [r for r in runs if r["kind"] == "execute"]
+            rs = [r for r in runs if r["kind"] == "restore"]
+            totals = {
+                "archived_confirmed": sum(r["by_action"].get("archive", 0) for r in ex),
+                "trashed_confirmed": sum(r["by_action"].get("trash", 0) for r in ex),
+                "restored_confirmed": sum(r["confirmed"] for r in rs),
+                "attempted": sum(r["attempted"] for r in ex),
+                "failed": sum(r["failed"] for r in ex),
+                "skipped_at_run_time": sum(r["skipped"] for r in ex),
+                "duration_s": round(sum(r["duration_s"] or 0 for r in ex), 1),
+                "runs_with_errors": sum(1 for r in ex if r["failed"] or r["error"]),
+            }
+            unsub = {o: n for o, n in c.execute("SELECT outcome, COUNT(*) FROM unsubscribe_log GROUP BY outcome")}
+            inbox_now = c.execute("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1").fetchone()[0]
+            skip_reasons = {a[0]: a[1] for a in c.execute(
+                "SELECT detail, COUNT(*) FROM audit_log WHERE status='skipped' GROUP BY detail ORDER BY 2 DESC LIMIT 10")}
+            errors = [dict(a) for a in c.execute(
+                "SELECT run_id, action, detail, COUNT(*) n FROM audit_log WHERE status='failed' "
+                "GROUP BY run_id, action, detail ORDER BY n DESC LIMIT 10")]
+        first = next((r["inbox_before"] for r in ex if r["inbox_before"] is not None), None)
+        return {
+            "inbox_before": first, "inbox_now": inbox_now, "totals": totals, "runs": runs,
+            "skip_reasons": skip_reasons, "errors": errors,
+            # unsubscribe: "attempted" is the write-ahead row; "accepted" means the sender answered HTTP 2xx
+            "unsubscribe": {"attempted": unsub.get("attempted", 0), "accepted": unsub.get("confirmed", 0),
+                            "not_confirmed": unsub.get("not_confirmed", 0), "failed": unsub.get("failed", 0),
+                            "refused": unsub.get("refused", 0), "manual": unsub.get("manual", 0),
+                            "simulated": unsub.get("simulated", 0)},
+        }
+
     @app.get("/api/runs")
     def runs():
         with db.connect() as c:
@@ -1002,6 +1083,7 @@ def create_app(state: State) -> FastAPI:
         elif not has_scan:
             db.set_setting("protection.rules_version", RULES_VERSION)
 
+    app.add_middleware(DemoMiddleware, masker=masker, enabled=demo_on, refresh=refresh_vocab)
     return app
 
 

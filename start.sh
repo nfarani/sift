@@ -145,7 +145,7 @@ cap = "unlocked" if s["full_runs_unlocked"] else "locked until a run + restore a
 print(f"  Mailbox:       {mailbox}")
 print(f"  Access:        {s['mode']}")
 print(f"  Classifier:    {s['classifier']['label']}")
-print(f"  Anthropic key: {s['anthropic_api_key']} (not used until Phase 3)")
+print(f"  Anthropic key: {s['anthropic_api_key']} (used for Claude classification)")
 print(f"  First-run cap: {s['first_run_cap']} messages ({cap})")
 EOF
 echo

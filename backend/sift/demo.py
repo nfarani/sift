@@ -1,0 +1,166 @@
+"""Demo mode: mask personal data in every API response, for screen recordings.
+
+Masking happens here, in the backend, so real addresses, names and subjects never reach the browser
+while demo mode is on. Masked addresses are reversible on the way back in (request bodies only), so
+excluding or protecting a sender still works during a recording. Nothing else changes: plans, the
+executor and the audit log always work on real ids.
+
+  - email addresses      n***a1b2@mail.example.com   (first letter, short hash, domain kept)
+  - display names         Sender #4821                (stable per name)
+  - subjects / snippets   hidden
+  - your own name parts   masked wherever they appear (derived from your address)
+  - digit runs of 6+      ####                        (order numbers, codes, phone numbers)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import threading
+
+EMAIL = re.compile(r"[A-Za-z0-9._%+\-=]+@([A-Za-z0-9\-]+\.)+[A-Za-z]{2,}")
+DIGITS = re.compile(r"\d{6,}")  # order numbers, codes, phones; leaves dates and run labels readable
+HIDDEN = "[hidden in demo mode]"
+# JSON keys whose values are message content: replaced entirely.
+CONTENT_KEYS = {"subject", "snippet", "subjects", "snippets", "sample_subjects", "subject_contains"}
+# JSON keys whose values are display names.
+NAME_KEYS = {"display_name", "from_name"}
+
+
+def _passthrough(key: str | None) -> bool:
+    """Identifiers, hashes, timestamps and statuses are never altered (the UI sends ids back)."""
+    if not key:
+        return False
+    k = key.lower()
+    return k == "id" or k.endswith(("_id", "_ids", "hash", "_at", "status", "state", "kind", "action"))
+
+
+def _h(s: str, n: int = 4) -> str:
+    return hashlib.sha256(s.lower().encode()).hexdigest()[:n]
+
+
+class Masker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reverse: dict[str, str] = {}      # masked address -> real address
+        self._names: dict[str, str] = {}        # real display name (lower) -> pseudonym
+        self._own_tokens: set[str] = set()
+
+    # -- vocabulary ---------------------------------------------------------
+    def learn(self, own_email: str | None, display_names: list[str]) -> None:
+        """Teach the masker the names to look for inside free text (Claude reasons, titles)."""
+        with self._lock:
+            if own_email:
+                local = own_email.split("@", 1)[0]
+                self._own_tokens = {t for t in re.split(r"[^A-Za-z]+", local) if len(t) >= 3}
+            for n in display_names:
+                n = (n or "").strip()
+                if len(n) >= 3 and " " in n:  # multi-word names (people) inside free text; brands stay readable
+                    self._names.setdefault(n.lower(), f"Sender #{int(_h(n, 6), 16) % 9000 + 1000}")
+
+    def address(self, addr: str) -> str:
+        local, _, domain = addr.partition("@")
+        masked = f"{local[:1].lower()}***{_h(addr)}@{domain.lower()}"
+        with self._lock:
+            self._reverse[masked] = addr
+        return masked
+
+    def name(self, n: str) -> str:
+        n = (n or "").strip()
+        if not n:
+            return n
+        return f"Sender #{int(_h(n, 6), 16) % 9000 + 1000}"
+
+    def text(self, s: str) -> str:
+        s = EMAIL.sub(lambda m: self.address(m.group(0)), s)
+        with self._lock:
+            names = sorted(self._names.items(), key=lambda kv: -len(kv[0]))
+            own = set(self._own_tokens)
+        for real, pseudo in names:
+            if real in s.lower():
+                s = re.sub(re.escape(real), pseudo, s, flags=re.I)
+        for t in own:
+            s = re.sub(rf"\b{re.escape(t)}\b", "You", s, flags=re.I)
+        return DIGITS.sub("####", s)
+
+    # -- JSON walk ----------------------------------------------------------
+    def mask(self, obj, key: str | None = None):
+        if isinstance(obj, dict):
+            return {k: self.mask(v, k) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self.mask(v, key) for v in obj]
+        if isinstance(obj, str):
+            if _passthrough(key):
+                return obj
+            if key in CONTENT_KEYS:
+                return HIDDEN if obj else obj
+            if key in NAME_KEYS:
+                return self.name(obj)
+            return self.text(obj)
+        return obj
+
+    def unmask(self, obj):
+        """Request bodies: turn masked addresses back into the real ones we handed out."""
+        if isinstance(obj, dict):
+            return {k: self.unmask(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self.unmask(v) for v in obj]
+        if isinstance(obj, str):
+            with self._lock:
+                return self._reverse.get(obj, obj)
+        return obj
+
+
+class DemoMiddleware:
+    """Pure ASGI middleware: masks JSON responses under /api/ and unmasks JSON request bodies,
+    only while `enabled()` is true."""
+
+    def __init__(self, app, masker: Masker, enabled, refresh):
+        self.app, self.masker, self.enabled, self.refresh = app, masker, enabled, refresh
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith("/api/") or not self.enabled():
+            return await self.app(scope, receive, send)
+        self.refresh()
+
+        async def receive_unmasked():
+            msg = await receive()
+            if msg["type"] == "http.request":
+                body = msg.get("body", b"")
+                while msg.get("more_body"):
+                    msg = await receive()
+                    body += msg.get("body", b"")
+                if body:
+                    try:
+                        body = json.dumps(self.masker.unmask(json.loads(body))).encode()
+                    except ValueError:
+                        pass
+                return {"type": "http.request", "body": body, "more_body": False}
+            return msg
+
+        start: dict = {}
+        chunks: list[bytes] = []
+
+        async def send_masked(msg):
+            if msg["type"] == "http.response.start":
+                start.update(msg)
+                return
+            if msg["type"] == "http.response.body":
+                chunks.append(msg.get("body", b""))
+                if msg.get("more_body"):
+                    return
+                body = b"".join(chunks)
+                headers = [(k, v) for k, v in start.get("headers", []) if k.lower() != b"content-length"]
+                ctype = dict(start.get("headers", [])).get(b"content-type", b"")
+                if body and ctype.startswith(b"application/json"):
+                    try:
+                        body = json.dumps(self.masker.mask(json.loads(body))).encode()
+                    except ValueError:
+                        body = json.dumps({"detail": HIDDEN}).encode()  # never pass unmasked text through
+                headers.append((b"content-length", str(len(body)).encode()))
+                await send({**start, "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+                return
+            await send(msg)
+
+        await self.app(scope, receive_unmasked, send_masked)
