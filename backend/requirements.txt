@@ -9,3 +9,4 @@ google-auth==2.62.1
 google-auth-oauthlib==1.5.0
 google-auth-httplib2==0.4.4
 keyring==25.7.0
+anthropic==2.4.0

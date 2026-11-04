@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 
-from .classifier.base import CATEGORIES, DISPOSABLE, Classifier, SenderGroup
+from .classifier.base import CATEGORIES, DISPOSABLE, KEEP, Classifier, SenderGroup
 from .db import Database, now_iso
 from .protection import load_context, protection_reason
 
@@ -77,25 +77,46 @@ def aggregate(db: Database, user_email: str) -> list[SenderGroup]:
             for k, s in stats.items()]
 
 
+def _like_escape(text: str) -> str:
+    return text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def classify(db: Database, classifier: Classifier, groups: list[SenderGroup]) -> int:
+    """Rules first; validated Claude labels (cached in ai_labels) then override unsettled groups.
+    Protection flags are untouched here: protected messages never enter a plan whatever the label."""
     result = classifier.classify(groups)
+    with db.connect() as c:
+        ai = {r["sender"]: r for r in c.execute("SELECT * FROM ai_labels")}
     with db.tx() as c:
         for sender, cl in result.items():
             if cl.category not in CATEGORIES:  # never trust an unknown label
                 cl.category, cl.confidence = "uncertain", 0.0
+            label, conf, reason, source, exceptions = cl.category, cl.confidence, cl.reason, cl.classifier, []
+            a = ai.get(sender)
+            if a is not None and cl.category != "personal" and a["category"] in CATEGORIES:
+                label, conf, reason, source = a["category"], a["confidence"], a["reason"], f"claude:{a['model']}"
+                exceptions = json.loads(a["exceptions"])
             c.execute("UPDATE sender_groups SET category=?, confidence=?, reason=?, classifier=? WHERE sender=?",
-                      (cl.category, cl.confidence, cl.reason, cl.classifier, sender))
-            c.execute("UPDATE messages SET category=? WHERE from_addr=? AND is_sent=0", (cl.category, sender))
-    return len({cl.category for cl in result.values()})
+                      (label, conf, reason, source, sender))
+            c.execute("UPDATE messages SET category=? WHERE from_addr=? AND is_sent=0", (label, sender))
+            # Per-message exceptions can only move mail towards keep categories (validated on the way in).
+            for e in exceptions:
+                if e.get("category") in KEEP and len(e.get("subject_contains", "").strip()) >= 4:
+                    c.execute("UPDATE messages SET category=? WHERE from_addr=? AND is_sent=0 "
+                              "AND lower(subject) LIKE ? ESCAPE '\\'",
+                              (e["category"], sender, f"%{_like_escape(e['subject_contains'].strip())}%"))
+    with db.connect() as c:
+        return c.execute("SELECT COUNT(DISTINCT category) FROM messages WHERE is_sent=0").fetchone()[0]
 
 
 def build_recommendations(db: Database, classifier: Classifier, scan_id: int | None) -> None:
     with db.connect() as c:
         rows = c.execute(
-            "SELECT category, SUM(total) n, SUM(total*confidence)/SUM(total) conf FROM sender_groups "
-            "WHERE category IS NOT NULL GROUP BY category").fetchall()
+            "SELECT category, SUM(total) n, SUM(total*confidence)/SUM(total) conf, "
+            "CASE WHEN SUM(classifier LIKE 'claude%') > 0 THEN 'rules+claude' ELSE 'rules' END clf "
+            "FROM sender_groups WHERE category IS NOT NULL GROUP BY category").fetchall()
     with db.tx() as c:
-        c.execute("DELETE FROM recommendations")
+        c.execute("DELETE FROM recommendations WHERE source IS NOT 'query'")  # saved NL queries survive rescans
         for r in rows:
             cat = r["category"]
             if cat not in DISPOSABLE and cat != "uncertain":
@@ -105,9 +126,10 @@ def build_recommendations(db: Database, classifier: Classifier, scan_id: int | N
                       if cat == "uncertain" else
                       f"{CATEGORIES[cat]}: bulk mail with no sign you've replied to it. Protected messages from the "
                       f"same senders (receipts, bookings, security, your threads) are excluded automatically.")
-            c.execute("INSERT INTO recommendations VALUES (?,?,?,?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO recommendations(id,category,title,action,older_than_days,reason,confidence,"
+                      "classifier,scan_id,created_at,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                       (cat, cat, TITLES.get(cat, CATEGORIES[cat]), action, DEFAULT_OLDER_THAN.get(cat, 0), reason,
-                       round(r["conf"] or 0, 2), classifier.name, scan_id, now_iso()))
+                       round(r["conf"] or 0, 2), r["clf"], scan_id, now_iso(), "rules" if r["clf"] == "rules" else "claude"))
 
 
 def run_analysis(db: Database, classifier: Classifier, user_email: str, scan_id: int | None) -> dict:

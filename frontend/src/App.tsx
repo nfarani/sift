@@ -10,10 +10,12 @@ import RunScreen from "./screens/RunScreen";
 import History from "./screens/History";
 import Account from "./screens/Account";
 import Connect from "./screens/Connect";
+import Claude from "./screens/Claude";
 
 const NAV: [string, string][] = [
   ["overview", "Overview"],
   ["scan", "Scan"],
+  ["claude", "Claude"],
   ["recommendations", "Recommendations"],
   ["confirm", "Confirm"],
   ["history", "Runs"],
@@ -62,10 +64,11 @@ export default function App() {
         {status && status.connection.state !== "connected" && page !== "account" ? <Connect status={status} onChange={reloadStatus} /> : <>
         {page === "overview" && <Overview go={go} />}
         {page === "scan" && <ScanScreen go={go} synthetic={!!status?.synthetic} />}
-        {page === "recommendations" && <Recommendations selection={selection} setSelection={setSelection} go={go} />}
+        {page === "recommendations" && <Recommendations selection={selection} setSelection={setSelection} go={go} ai={status?.ai ?? { available: false, reason: null }} />}
         {page === "confirm" && <Confirm selection={selection} status={status} go={go} />}
         {page === "run" && arg && <RunScreen runId={Number(arg)} go={go} onChange={reloadStatus} status={status} />}
         {page === "history" && <History go={go} />}
+        {page === "claude" && <Claude go={go} />}
         {page === "account" && <Account status={status} onChange={reloadStatus} />}
         </>}
       </main>

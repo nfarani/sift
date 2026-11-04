@@ -42,6 +42,9 @@ class Settings:
     # Hosts allowed to talk to the API (DNS-rebinding guard). Ports are added from api_port/ui_port.
     extra_allowed_hosts: tuple[str, ...] = ()
     ui_port: int = field(default_factory=lambda: _int("SIFT_UI_PORT", 5173))
+    spend_cap_usd: float = field(default_factory=lambda: float(os.environ.get("SIFT_AI_SPEND_CAP_USD", "") or 2.0))
+    model_bulk: str = field(default_factory=lambda: os.environ.get("SIFT_MODEL_BULK", "").strip() or "claude-haiku-4-5")
+    model_review: str = field(default_factory=lambda: os.environ.get("SIFT_MODEL_REVIEW", "").strip() or "claude-opus-5-5")
     anthropic_key_set: bool = field(default_factory=lambda: bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()))
     # Backoff: base delay in seconds, doubled each attempt, capped.
     backoff_base: float = 0.5
@@ -75,7 +78,8 @@ class Settings:
             "synthetic": self.provider == "mock",
             "client_secrets_present": self.client_secrets.exists() if self.provider == "gmail" else None,
             "anthropic_api_key": "set" if self.anthropic_key_set else "not set",
-            "ai_enabled": False,  # Phase 1: rules only, no AI calls are made.
+            "spend_cap_usd": self.spend_cap_usd,
+            "models": {"bulk": self.model_bulk, "review": self.model_review},
             "first_run_cap": self.first_run_cap,
             "demo_mode": self.demo_mode,
         }

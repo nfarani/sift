@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from .db import Database, now_iso
+from .query import Spec, matching_ids, parse_spec, where
 
 ACTIONS = {"archive", "trash"}
 
@@ -56,6 +57,24 @@ def _select(c, item: PlanItem, cutoff_ms: int) -> tuple[list[str], dict]:
                  "too_recent": too_recent, "user_excluded": user_excluded}
 
 
+def _select_spec(c, item: PlanItem, spec: Spec, now_ms: int) -> tuple[list[str], dict]:
+    """Custom (natural-language) recommendation: same deterministic filter as its preview.
+    Protected and sent mail are excluded by query.where() itself."""
+    if spec.mode != "messages":
+        raise PlanError("a top-senders view can't be turned into a plan; save a message filter instead")
+    excl = tuple(s.lower() for s in item.excluded_senders)
+    ids = matching_ids(c, spec, excl, item.older_than_days, now_ms)
+    wp, pp = where(spec, now_ms=now_ms, protected=1)
+    by_reason = {r[0]: r[1] for r in c.execute(
+        f"SELECT protect_reason, COUNT(*) FROM messages WHERE {wp} GROUP BY protect_reason", pp)}
+    wa, pa = where(spec, now_ms=now_ms)                      # no exclusions, no extra age
+    all_ = c.execute(f"SELECT COUNT(*) FROM messages WHERE {wa}", pa).fetchone()[0]
+    wx, px = where(spec, now_ms=now_ms, extra_older_than_days=item.older_than_days)
+    aged = c.execute(f"SELECT COUNT(*) FROM messages WHERE {wx}", px).fetchone()[0]
+    return ids, {"protected_excluded": sum(by_reason.values()), "protected_by_reason": by_reason,
+                 "too_recent": all_ - aged, "user_excluded": aged - len(ids)}
+
+
 def create_plan(db: Database, items: list[PlanItem]) -> dict:
     if not items:
         raise PlanError("a plan needs at least one recommendation")
@@ -70,7 +89,7 @@ def create_plan(db: Database, items: list[PlanItem]) -> dict:
             raise PlanError("older_than_days must be >= 0")
     now_ms = int(time.time() * 1000)
     with db.tx() as c:
-        recs = {r["id"]: r for r in c.execute("SELECT id, action FROM recommendations")}
+        recs = {r["id"]: r for r in c.execute("SELECT id, action, spec FROM recommendations")}
         for it in items:
             if it.rec_id not in recs:
                 raise PlanError(f"unknown recommendation {it.rec_id}")
@@ -79,8 +98,10 @@ def create_plan(db: Database, items: list[PlanItem]) -> dict:
         rows: list[tuple[str, str, str]] = []
         per_item = []
         for it in items:
-            cutoff = now_ms - it.older_than_days * 86_400_000
-            ids, info = _select(c, it, cutoff)
+            spec = parse_spec(json.loads(recs[it.rec_id]["spec"])) if recs[it.rec_id]["spec"] else None
+            older = max(it.older_than_days, (spec.older_than_days or 0) if spec else 0)
+            cutoff = now_ms - older * 86_400_000
+            ids, info = _select_spec(c, it, spec, now_ms) if spec else _select(c, it, cutoff)
             rows += [(mid, it.rec_id, it.action) for mid in ids]
             per_item.append({"rec_id": it.rec_id, "action": it.action, "older_than_days": it.older_than_days,
                              "cutoff_ms": cutoff, "excluded_senders": sorted(s.lower() for s in it.excluded_senders),

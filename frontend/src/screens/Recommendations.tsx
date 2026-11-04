@@ -3,11 +3,15 @@ import { api, Recommendation } from "../api";
 import { usePoll } from "../hooks";
 import { AGE_OPTIONS, ageLabel, day, n, pct, plural } from "../format";
 import { RecChoice, Selection } from "../selection";
+import Ask from "./Ask";
 
-interface RecsResponse { classifier: { label: string; uses_ai: boolean }; items: Recommendation[] }
-interface Props { selection: Selection; setSelection: (f: (s: Selection) => Selection) => void; go: (r: string) => void }
+interface RecsResponse { classifier: { label: string; uses_ai: boolean; ai_groups?: number }; items: Recommendation[] }
+interface Props {
+  selection: Selection; setSelection: (f: (s: Selection) => Selection) => void; go: (r: string) => void;
+  ai: { available: boolean; reason: string | null };
+}
 
-export default function Recommendations({ selection, setSelection, go }: Props) {
+export default function Recommendations({ selection, setSelection, go, ai }: Props) {
   const { data, error, reload } = usePoll(() => api.get<RecsResponse>("/recommendations"), null);
   const [previews, setPreviews] = useState<Record<string, Recommendation>>({});
   const [catFilter, setCatFilter] = useState("all");
@@ -77,11 +81,14 @@ export default function Recommendations({ selection, setSelection, go }: Props) 
         <div>
           <h1>Recommendations</h1>
           <p className="muted">
-            {data.classifier.uses_ai ? "Classified by Claude where rules weren't sure." :
+            {data.classifier.uses_ai ? `Rules first; Claude labelled ${n(data.classifier.ai_groups ?? 0)} senders the rules weren't sure about. Protection always wins.` :
               "Classified by deterministic rules only. No AI was used; uncertain senders go to review."}
+            {!data.classifier.uses_ai && ai.available && <> <a href="#/claude">Run Claude on them →</a></>}
           </p>
         </div>
       </div>
+
+      <Ask available={ai.available} reason={ai.reason} onSaved={() => { setPreviews({}); reload(); }} />
 
       <div className="filters">
         <label>Category
@@ -119,7 +126,8 @@ export default function Recommendations({ selection, setSelection, go }: Props) 
       {items.map((r) =>
         r.action === "review"
           ? <ReviewCard key={r.id} rec={r} onProtect={protectSender} />
-          : <RecCard key={r.id} rec={r} choice={choiceFor(r)} onChange={(p) => update(r, p)} onProtect={protectSender} senderQ={senderQ} />,
+          : <RecCard key={r.id} rec={r} choice={choiceFor(r)} onChange={(p) => update(r, p)} onProtect={protectSender} senderQ={senderQ}
+              onRemove={r.source === "query" ? async () => { await api.del(`/recommendations/${r.id}`); setSelection((s) => { const x = { ...s }; delete x[r.id]; return x; }); reload(); } : undefined} />,
       )}
 
       <div className="footer-bar">
@@ -135,9 +143,9 @@ export default function Recommendations({ selection, setSelection, go }: Props) 
   );
 }
 
-function RecCard({ rec, choice, onChange, onProtect, senderQ }: {
+function RecCard({ rec, choice, onChange, onProtect, senderQ, onRemove }: {
   rec: Recommendation; choice: RecChoice; onChange: (p: Partial<RecChoice>) => void;
-  onProtect: (s: string) => void; senderQ: string;
+  onProtect: (s: string) => void; senderQ: string; onRemove?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const toggleSender = (s: string) =>
@@ -155,7 +163,8 @@ function RecCard({ rec, choice, onChange, onProtect, senderQ }: {
         <div className="rec-title">
           <h3>{rec.title}</h3>
           <div className="rec-meta">
-            <span className="tag">{rec.category_label}</span>
+            <span className={`tag ${rec.source === "query" ? "tag-keep" : ""}`}>{rec.category_label}</span>
+            {rec.source === "query" && onRemove && <button className="btn btn-link small" onClick={onRemove}>Remove</button>}
             <span>{plural(rec.sender_count, "sender")}</span>
             {rec.date_range[0] && <span>{rec.date_range[0]} → {rec.date_range[1]}</span>}
             <Confidence value={rec.confidence} />
@@ -228,7 +237,9 @@ function RecCard({ rec, choice, onChange, onProtect, senderQ }: {
                 return (
                   <tr key={s.sender} className={excluded ? "excluded" : ""}>
                     <td><input type="checkbox" checked={!excluded} onChange={() => toggleSender(s.sender)} aria-label={`Include ${s.sender}`} /></td>
-                    <td><div className="sender-name">{s.display_name}</div><div className="sender-addr">{s.sender}</div></td>
+                    <td><div className="sender-name">{s.display_name}</div><div className="sender-addr">{s.sender}</div>
+                      {s.classifier && <div className={`src ${s.classifier.startsWith("claude") ? "src-claude" : ""}`} title={s.reason ?? ""}>
+                        {s.classifier.startsWith("claude") ? "Claude" : "Rules"}{s.reason ? ` · ${s.reason}` : ""}</div>}</td>
                     <td className="num">{excluded ? "—" : n(s.eligible)}</td>
                     <td className="num">{n(s.protected_in_inbox)}</td>
                     <td className="num">{n(s.unread)}</td>

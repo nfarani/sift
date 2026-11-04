@@ -23,6 +23,12 @@ from .providers.base import MailReader, MailWriter, ProviderError
 from .providers.gmail_auth import (AuthError, ReauthRequired, TokenStore, check_scopes, credential_store_name,
                                    revoke, run_consent_flow)
 from .providers.mock import MockProvider
+from .ai import run as ai_run
+from .ai.ledger import Ledger, SpendCapReached
+from .ai.planner import PlannerError, QueryPlanner
+from .classifier.claude import ClaudeClassifier
+from .query import SpecError, parse_spec
+from .query import preview as query_preview
 from .retry import RetryPolicy
 from .scanner import Scanner
 
@@ -42,6 +48,10 @@ class State:
     retry: RetryPolicy
     token_store: TokenStore | None = None
     reader_factory: object = None
+    ledger: Ledger | None = None
+    claude: ClaudeClassifier | None = None
+    planner: QueryPlanner | None = None
+    ai_unavailable_reason: str | None = None
     connection: dict = field(default_factory=lambda: {"state": "disconnected", "error": None})
 
     def attach(self, reader: MailReader | None, writer: MailWriter | None) -> None:
@@ -74,17 +84,32 @@ class ScanIn(BaseModel):
     max_messages: int | None = Field(None, ge=1, le=1_000_000)  # test scan: cap Sent and Inbox each
 
 
+class AiRunIn(BaseModel):
+    within_cap: bool = False          # run biggest groups first and stop at the cap
+    approved_estimate_usd: float      # what the user saw and approved
+
+
+class QueryIn(BaseModel):
+    text: str
+
+
+class SpecIn(BaseModel):
+    spec: dict
+
+
 class RuleIn(BaseModel):
     kind: str
     value: str
 
 
 def build_state(settings: Settings, provider: MailReader | None = None, retry: RetryPolicy | None = None,
-                token_store: TokenStore | None = None, reader_factory=None) -> State:
+                token_store: TokenStore | None = None, reader_factory=None, ai_client=None) -> State:
     db = Database(settings.app_db)
     retry = retry or RetryPolicy(settings.max_attempts, settings.backoff_base, settings.backoff_max)
     classifier = RuleOnlyClassifier()
     state = State(settings, db, None, None, classifier, None, Executor(db, None, None), JobRunner(db), retry)
+    state.ledger = Ledger(db, settings.spend_cap_usd)
+    _attach_ai(state, ai_client)
     if provider is None and settings.provider == "mock":
         provider = MockProvider(settings.mock_db, size=settings.mock_size, seed=settings.mock_seed,
                                 latency_ms=settings.mock_latency_ms)
@@ -106,6 +131,26 @@ def build_state(settings: Settings, provider: MailReader | None = None, retry: R
         except AuthError as e:
             state.connection = {"state": "error", "error": str(e)}
     return state
+
+
+def _attach_ai(state: State, client=None) -> None:
+    """Claude is optional. Without a key the app runs rules-only and says so; it never fakes AI output."""
+    s = state.settings
+    if client is None:
+        if not s.anthropic_key_set:
+            state.ai_unavailable_reason = "ANTHROPIC_API_KEY is not set in .env"
+            return
+        import anthropic
+        client = anthropic.Anthropic(max_retries=3)
+    try:
+        state.claude = ClaudeClassifier(client, state.ledger, s.model_bulk, s.model_review)
+        state.planner = QueryPlanner(client, state.ledger, s.model_review)
+        from .ai.ledger import price
+        price(s.model_bulk), price(s.model_review)  # refuse unknown models up front
+        state.ai_unavailable_reason = None
+    except ValueError as e:
+        state.claude = state.planner = None
+        state.ai_unavailable_reason = str(e)
 
 
 def _gmail_reader(creds, store):
@@ -165,6 +210,14 @@ def create_app(state: State) -> FastAPI:
         db.set_setting("account.email", email)
         return email
 
+    def classifier_info() -> dict:
+        with db.connect() as c:
+            n_ai = c.execute("SELECT COUNT(*) FROM sender_groups WHERE classifier LIKE 'claude%'").fetchone()[0]
+        if n_ai:
+            return {"name": "rules+claude", "label": "Rules + Claude", "uses_ai": True, "ai_groups": n_ai}
+        label = "Rules only, no AI" if state.claude is None else "Rules only (Claude not run yet)"
+        return {"name": "rules", "label": label, "uses_ai": False, "ai_groups": 0}
+
     # -- status / dashboard ---------------------------------------------------
     @app.get("/api/status")
     def status():
@@ -181,8 +234,8 @@ def create_app(state: State) -> FastAPI:
                 "synthetic": synthetic, "connection": state.connection,
                 "can_modify": state.writer is not None,
                 "credential_store": credential_store_name() if state.token_store else None,
-                "classifier": {"name": state.classifier.name, "label": state.classifier.label,
-                               "uses_ai": state.classifier.uses_ai},
+                "classifier": classifier_info(),
+                "ai": {"available": state.claude is not None, "reason": state.ai_unavailable_reason},
                 "mode": mode, "full_runs_unlocked": unlocked(db), "busy": state.jobs.busy()}
 
     # -- Gmail connection (read-only) -----------------------------------------
@@ -336,14 +389,38 @@ def create_app(state: State) -> FastAPI:
         return _scan_row(r["id"])
 
     # -- recommendations ------------------------------------------------------
+    def _spec_rec_detail(rec, older_than=None, excluded=()):
+        """Custom recommendation from a saved natural-language query: same deterministic filter as the plan."""
+        spec = parse_spec(json.loads(rec["spec"]))
+        older = rec["older_than_days"] if older_than is None else older_than
+        excl = tuple(e.lower() for e in excluded)
+        pv = query_preview(db, spec, extra_older_than_days=older)
+        pv_ex = query_preview(db, spec, excluded_senders=excl, extra_older_than_days=older) if excl else pv
+        with db.connect() as c:
+            inbox = c.execute("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1").fetchone()[0]
+        senders = [{"sender": x["sender"], "display_name": x["display_name"], "total": x["n"], "in_inbox": x["n"],
+                    "unread": x["unread"], "eligible": x["n"], "protected_in_inbox": 0, "excluded": x["sender"] in excl,
+                    "first_date": _ms_to_iso(x["first"]), "last_date": _ms_to_iso(x["last"]), "list_id": None,
+                    "has_unsub": 0, "one_click_unsub": 0, "confidence": None, "reason": None} for x in pv["senders"]]
+        return {**dict(rec), "spec": spec.to_dict(), "category_label": "Your request", "older_than_days": older,
+                "count": pv_ex["count"], "sender_count": len(senders), "senders": senders,
+                "exceptions": [{"reason": "protected (receipts, bookings, security, starred, your threads)",
+                                "count": pv["protected_excluded"]}] if pv["protected_excluded"] else [],
+                "protected_count": pv["protected_excluded"], "examples": pv_ex["samples"][:5], "protected_examples": [],
+                "date_range": [_ms_to_iso(pv_ex["date_range"][0]), _ms_to_iso(pv_ex["date_range"][1])],
+                "impact_pct": round(100 * pv_ex["count"] / inbox, 1) if inbox else 0,
+                "unsubscribe_one_click": 0, "unsubscribe_manual": 0}
+
     def _rec_detail(c, rec, older_than=None, excluded=()):
+        if rec["spec"]:
+            return _spec_rec_detail(rec, older_than, excluded)
         older = rec["older_than_days"] if older_than is None else older_than
         cutoff = int(time.time() * 1000) - older * 86_400_000
         excl = [e.lower() for e in excluded]
         senders = []
         for s in c.execute(
             "SELECT sender, display_name, total, in_inbox, unread, protected, first_date, last_date, list_id, "
-            "has_unsub, one_click_unsub, confidence, reason FROM sender_groups WHERE category=? ORDER BY total DESC",
+            "has_unsub, one_click_unsub, confidence, reason, classifier FROM sender_groups WHERE category=? ORDER BY total DESC",
             (rec["id"],)):
             eligible = c.execute("SELECT COUNT(*) FROM messages WHERE from_addr=? AND is_sent=0 AND in_inbox=1 "
                                  "AND protected=0 AND internal_date < ?", (s["sender"], cutoff)).fetchone()[0]
@@ -381,9 +458,7 @@ def create_app(state: State) -> FastAPI:
             recs = c.execute("SELECT * FROM recommendations ORDER BY action='review', id").fetchall()
             out = [_rec_detail(c, r) for r in recs]
         out.sort(key=lambda r: (r["action"] == "review", -r["count"]))
-        return {"classifier": {"name": state.classifier.name, "label": state.classifier.label,
-                               "uses_ai": state.classifier.uses_ai},
-                "defaults": DEFAULT_OLDER_THAN, "items": out}
+        return {"classifier": classifier_info(), "defaults": DEFAULT_OLDER_THAN, "items": out}
 
     @app.post("/api/recommendations/{rec_id}/preview")
     def preview(rec_id: str, body: PreviewIn):
@@ -392,6 +467,123 @@ def create_app(state: State) -> FastAPI:
             if not rec:
                 bad("unknown recommendation", 404)
             return _rec_detail(c, rec, body.older_than_days, body.excluded_senders)
+
+    @app.delete("/api/recommendations/{rec_id}")
+    def delete_rec(rec_id: str):
+        with db.connect() as c:
+            n = c.execute("DELETE FROM recommendations WHERE id=? AND source='query'", (rec_id,)).rowcount
+        if not n:
+            bad("only saved requests can be removed", 404)
+        return {"ok": True}
+
+    # -- Claude: classification -----------------------------------------------
+    def need_ai():
+        if state.claude is None:
+            bad(f"Claude is not available: {state.ai_unavailable_reason}", 409)
+
+    def _ai_run_row(run_id=None):
+        with db.connect() as c:
+            r = (c.execute("SELECT * FROM ai_runs WHERE id=?", (run_id,)) if run_id else
+                 c.execute("SELECT * FROM ai_runs ORDER BY id DESC LIMIT 1")).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["estimate"] = json.loads(d["estimate"])
+        return d
+
+    @app.get("/api/ai")
+    def ai_status():
+        with db.connect() as c:
+            labelled = c.execute("SELECT COUNT(*) FROM ai_labels").fetchone()[0]
+        return {"available": state.claude is not None, "reason": state.ai_unavailable_reason,
+                "models": {"bulk": state.settings.model_bulk, "review": state.settings.model_review},
+                "cap_usd": state.settings.spend_cap_usd, "usage": state.ledger.totals(),
+                "labelled_senders": labelled, "last_run": _ai_run_row(), "classifier": classifier_info()}
+
+    @app.post("/api/ai/estimate")
+    def ai_estimate():
+        """Local estimate only. Nothing is sent to Anthropic."""
+        need_ai()
+        need_reader()
+        return ai_run.estimate(db, state.claude, state.settings.spend_cap_usd)
+
+    @app.post("/api/ai/run")
+    def ai_start(body: AiRunIn):
+        need_ai()
+        need_reader()
+        if state.jobs.busy():
+            bad("another job is running", 409)
+        est = ai_run.estimate(db, state.claude, state.settings.spend_cap_usd)
+        if est["groups"] == 0:
+            bad("nothing to classify: every sender is settled by rules or already labelled")
+        if est["usd"] > state.settings.spend_cap_usd and not body.within_cap:
+            bad(f"estimated ${est['usd']:.2f} exceeds your ${state.settings.spend_cap_usd:.2f} cap; "
+                "run within the cap or raise SIFT_AI_SPEND_CAP_USD in .env")
+        # The approval must match what the user saw (the estimate can move if data changed).
+        shown = min(est["usd"], state.settings.spend_cap_usd) if body.within_cap else est["usd"]
+        if abs(body.approved_estimate_usd - shown) > 0.01 + 0.05 * shown:
+            bad("the estimate changed since you approved it; review the new estimate")
+        with db.connect() as c:
+            rid = c.execute("INSERT INTO ai_runs(status,started_at,cap_usd,estimate,current_op) "
+                            "VALUES ('running',?,?,?,'starting')",
+                            (now_iso(), state.settings.spend_cap_usd, json.dumps(est))).lastrowid
+
+        def crash(msg):
+            with db.connect() as c:
+                c.execute("UPDATE ai_runs SET status='failed', error=?, finished_at=? WHERE id=?",
+                          (msg[:300], now_iso(), rid))
+
+        state.jobs.submit("ai", lambda: ai_run.run(db, state.claude, rid, state.provider.account_email()), crash)
+        return _ai_run_row(rid)
+
+    @app.get("/api/ai/run")
+    def ai_run_status():
+        return _ai_run_row() or {"status": "none"}
+
+    @app.post("/api/ai/run/cancel")
+    def ai_cancel():
+        with db.connect() as c:
+            c.execute("UPDATE ai_runs SET cancel_requested=1 WHERE status='running'")
+        return _ai_run_row() or {"status": "none"}
+
+    # -- Claude: natural-language requests ------------------------------------
+    @app.post("/api/query/plan")
+    def query_plan(body: QueryIn):
+        """Sentence -> filter spec. Returns the spec and a local preview. Creates nothing."""
+        need_ai()
+        try:
+            spec = state.planner.plan(body.text)
+        except (PlannerError, SpendCapReached) as e:
+            bad(e)
+        return {"spec": spec.to_dict(), "preview": query_preview(db, spec)}
+
+    @app.post("/api/query/preview")
+    def query_preview_ep(body: SpecIn):
+        try:
+            spec = parse_spec(body.spec)
+        except SpecError as e:
+            bad(e)
+        return {"spec": spec.to_dict(), "preview": query_preview(db, spec)}
+
+    @app.post("/api/query/save")
+    def query_save(body: SpecIn):
+        """Turn a spec you reviewed into an editable recommendation. It still needs the normal plan approval."""
+        try:
+            spec = parse_spec(body.spec)
+        except SpecError as e:
+            bad(e)
+        if spec.mode != "messages":
+            bad("only message filters can be saved as recommendations")
+        with db.connect() as c:
+            n = c.execute("SELECT COUNT(*) FROM recommendations WHERE source='query'").fetchone()[0]
+            rid = f"q{int(time.time())}{n}"
+            c.execute("INSERT INTO recommendations(id,category,title,action,older_than_days,reason,confidence,"
+                      "classifier,created_at,spec,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                      (rid, "custom", spec.title or "Your request",
+                       "trash" if spec.suggested_action == "trash" else "archive", 0,
+                       spec.explanation or "Saved from your request.", 1.0, "you + Claude", now_iso(),
+                       json.dumps(spec.to_dict()), "query"))
+        return {"id": rid}
 
     # -- protection rules -----------------------------------------------------
     def _reanalyse():

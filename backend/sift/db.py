@@ -102,6 +102,50 @@ CREATE TABLE IF NOT EXISTS recommendations (
     created_at      TEXT NOT NULL
 );
 
+-- Every Anthropic API call: what it cost and why. Spend cap is enforced against this.
+CREATE TABLE IF NOT EXISTS ai_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    run_id        INTEGER,                    -- ai_runs.id
+    purpose       TEXT NOT NULL,              -- classify_bulk | classify_review | query_plan
+    model         TEXT NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL NOT NULL DEFAULT 0,
+    ok            INTEGER NOT NULL,           -- 1 = response accepted, 0 = rejected/failed
+    detail        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ai_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    status         TEXT NOT NULL,             -- running | completed | stopped_at_cap | cancelled | failed
+    started_at     TEXT NOT NULL,
+    finished_at    TEXT,
+    cap_usd        REAL NOT NULL,
+    estimate       TEXT NOT NULL DEFAULT '{}',
+    groups_total   INTEGER NOT NULL DEFAULT 0,
+    groups_done    INTEGER NOT NULL DEFAULT 0,
+    groups_failed  INTEGER NOT NULL DEFAULT 0,
+    groups_reviewed INTEGER NOT NULL DEFAULT 0,
+    cost_usd       REAL NOT NULL DEFAULT 0,
+    current_op     TEXT,
+    error          TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0
+);
+
+-- Validated Claude labels per sender, reused across rescans so they're paid for once.
+CREATE TABLE IF NOT EXISTS ai_labels (
+    sender      TEXT PRIMARY KEY,
+    category    TEXT NOT NULL,
+    confidence  REAL NOT NULL,
+    reason      TEXT NOT NULL,
+    exceptions  TEXT NOT NULL DEFAULT '[]',   -- [{subject_contains, category(keep only), reason}]
+    model       TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS plans (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     status        TEXT NOT NULL,              -- draft | approved | running | completed | partial | cancelled | superseded
@@ -205,10 +249,15 @@ class Database:
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
         """Add columns introduced after a database was first created."""
-        cols = {r[1] for r in c.execute("PRAGMA table_info(scans)")}
-        for name, decl in (("max_per_phase", "INTEGER"), ("rate_mps", "REAL"), ("eta_s", "REAL")):
-            if name not in cols:
-                c.execute(f"ALTER TABLE scans ADD COLUMN {name} {decl}")
+        for table, adds in (
+            ("scans", (("max_per_phase", "INTEGER"), ("rate_mps", "REAL"), ("eta_s", "REAL"))),
+            # spec: JSON filter for natural-language (custom) recommendations; source: rules | claude | query
+            ("recommendations", (("spec", "TEXT"), ("source", "TEXT"))),
+        ):
+            cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            for name, decl in adds:
+                if name not in cols:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)

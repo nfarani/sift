@@ -38,7 +38,9 @@ export interface Status {
   credential_store: string | null;
   synthetic: boolean;
   provider_name: string;
-  classifier: { name: string; label: string; uses_ai: boolean };
+  classifier: { name: string; label: string; uses_ai: boolean; ai_groups?: number };
+  ai: { available: boolean; reason: string | null };
+  spend_cap_usd: number;
   anthropic_api_key: string;
   first_run_cap: number;
   full_runs_unlocked: boolean;
@@ -98,11 +100,53 @@ export interface SenderRow {
   list_id: string | null;
   has_unsub: number;
   one_click_unsub: number;
-  confidence: number;
-  reason: string;
+  confidence: number | null;
+  reason: string | null;
+  classifier?: string | null;
 }
 
 export interface MsgSample { id: string; from_addr: string; from_name: string; subject: string; internal_date: number; protect_reason?: string }
+
+export interface Spec {
+  mode: "messages" | "top_senders";
+  title: string;
+  categories: string[];
+  sender_contains: string[];
+  subject_contains_any: string[];
+  subject_excludes_any: string[];
+  older_than_days: number | null;
+  newer_than_days: number | null;
+  unread_only: boolean;
+  suggested_action: "archive" | "trash" | "review";
+  explanation: string;
+  not_supported: string[];
+}
+
+export interface QueryPreview {
+  count: number;
+  protected_excluded: number;
+  samples: MsgSample[];
+  senders: { sender: string; display_name: string; n: number; unread: number; first: number; last: number }[];
+  date_range: [number | null, number | null];
+}
+
+export interface PassEstimate { model: string; requests: number; input_tokens: number; output_tokens: number; usd: number }
+export interface AiEstimate {
+  groups: number; bulk: PassEstimate; review: PassEstimate; review_share_assumed: number; usd: number;
+  messages_in_candidates: number; inbox: number; cap_usd: number;
+  within_cap: { groups: number; messages: number }; sends: string;
+}
+export interface AiRun {
+  id: number; status: "running" | "completed" | "stopped_at_cap" | "cancelled" | "failed" | "none";
+  started_at: string; finished_at: string | null; cap_usd: number; estimate: AiEstimate;
+  groups_total: number; groups_done: number; groups_failed: number; groups_reviewed: number;
+  cost_usd: number; current_op: string | null; error: string | null;
+}
+export interface AiStatus {
+  available: boolean; reason: string | null; models: { bulk: string; review: string }; cap_usd: number;
+  usage: { by: { purpose: string; model: string; calls: number; i: number; o: number; usd: number; rejected: number }[]; total_usd: number };
+  labelled_senders: number; last_run: AiRun | null;
+}
 
 export interface Recommendation {
   id: string;
@@ -125,6 +169,8 @@ export interface Recommendation {
   impact_pct: number;
   unsubscribe_one_click: number;
   unsubscribe_manual: number;
+  source?: "rules" | "claude" | "query" | null;
+  spec?: Spec;
 }
 
 export interface PlanItemSummary {
