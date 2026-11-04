@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Current phase
-Phase 4 gate **PASSED** on 2026-11-04. Next: `/phase-5` (waits for Nick).
+Phase 5 gate **PASSED** on 2026-11-04. All five phases done. Next: Nick's full cleanup run (and recording).
 
 ## Phase status
 | Phase | Status | Gate |
@@ -10,7 +10,7 @@ Phase 4 gate **PASSED** on 2026-11-04. Next: `/phase-5` (waits for Nick).
 | 2. Read-only Gmail | done | PASSED 2026-11-04 (113/113 tests; safety audit SAFE TO PROCEED; 500-message and full scans on Nick's account) |
 | 3. Claude classification + NL | done | PASSED 2026-11-04 (189/189 tests; safety audit BLOCKING → fixed in e00d2b8 → re-check SAFE TO PROCEED; live run on Nick's account, 20-sender spot-check OK) |
 | 4. First real modifications | done | 2026-11-04: 322/322 tests; safety audit SAFE TO PROCEED (3 FAILs fixed in 8c26df5, re-checked); live 50-message run + restore 50/50 confirmed by re-read and DB audit; Nick checked Gmail: label search returns nothing after restore |
-| 5. Full run, polish, demo | not started | — |
+| 5. Full run, polish, demo | done | PASSED 2026-11-04 (330/330 tests; safety audit BLOCKING (demo-mode masked strings with demo off) + 2 FAILs fixed in 3e74cfd, re-check SAFE TO PROCEED; full real-inbox run is Nick's to start) |
 
 ## Done (Phase 1, each verified by a test or a manual check)
 - `./start.sh`: checks Python 3.12+/Node 20.19+, creates `.env`, installs deps, starts API (127.0.0.1:8765) + UI (127.0.0.1:5173), prints URL and config status. Manually run.
@@ -89,10 +89,30 @@ Phase 4 gate **PASSED** on 2026-11-04. Next: `/phase-5` (waits for Nick).
   - Run #2 (restore of #1): 50 attempted, 50 confirmed, 0 failed. Inbox back to 97,517.
   - Safety check of the live DB: same 50 ids, all in the plan, none protected, no UNREAD or Trash changes.
 
+## Done (Phase 5)
+- Full cleanup with live progress and cancel:
+  - Run screen polls every second and shows progress (confirmed / skipped / failed, with an attempted layer), the current step and elapsed time.
+  - The cancel panel explains what stops and what stays restorable.
+  - Large-run and Trash notes on Confirm.
+  - Checked in a headless-Chrome click-through on a synthetic mailbox: 3-recommendation plan with Trash, a 2,118-message run, cancelled at 500 confirmed with 1,618 untouched.
+- Before/after report (`/api/report`, Report screen):
+  - Inbox before → after; archived/trashed/restored confirmed; attempted; skipped (top reasons); failures (top errors); duration; a per-run table.
+  - Unsubscribe attempted vs accepted (HTTP 2xx) vs not confirmed / failed / refused / manual / simulated.
+  - Test: `test_report_counts_runs_restores_and_duration`.
+- Demo mode (`sift/demo.py`; top-bar switch and badge; `POST /api/demo`, default `SIFT_DEMO_MODE`). The backend masks every `/api` JSON response:
+  - addresses (8-char hash, domain kept), display names, subjects/snippets, List-Ids, your own name parts, 6+ digit runs
+  - Request bodies are unmasked back to the exact address issued; the map is rebuilt from senders after a restart.
+  - Masked addresses it can't map (or ambiguous ones) are refused with 409, also when demo mode is off.
+  - The UI refetches on toggle and never stores selections in demo mode.
+  - Tests: `test_demo.py` (no real address/subject/person name in any GET; masked exclusions round-trip; survives restart; refused with demo off; List-Ids masked; collisions refused).
+- Docs: README rewritten as a product README; `docs/ARCHITECTURE.md` with a mermaid diagram, pipeline, trust boundaries and data.
+
 ## Next
-- Nick: click "Unlock full runs" (backend allows it: run 1 fully restored).
-- `/phase-5`: full run, polish, demo mode (build PII masking before recording anything for publishing).
+- Nick: full cleanup run on the real inbox from the Recommendations screen (about 76k archivable messages; estimated 4-12 hours because each message is re-read before and after).
+  - Record with demo mode on: turn it on before `./start.sh` so the terminal line is masked too, and don't record Google's own screens.
+  - The scan is valid for runs until 2026-11-11 ~06:45 UTC (7-day limit).
 - Ask Nick before the first real unsubscribe batch.
+- Optional, not built: maintenance view (new senders since last scan, suggested rules).
 
 ## Known issues
 **Open from the Phase 3 safety review** (not blocking for Phase 3; the executor-related ones block Phase 4):
@@ -120,7 +140,14 @@ Phase 4 gate **PASSED** on 2026-11-04. Next: `/phase-5` (waits for Nick).
 - Unsubscribe can't verify DKIM over the List-Unsubscribe headers (metadata only); the per-batch approval is the safeguard.
 
 **Other**
-- Demo mode (PII masking) not built (Phase 5). It must mask: your own address (header chip, Overview subtitle, Account page, `./start.sh` "Mailbox:" line), sender names and addresses, subjects/snippets, and person names in display names. Build it before recording the Phase 4 run for publishing.
+- Demo mode limits (Phase 5 review notes):
+  - Claude's per-sender reasons are text-masked, not hidden, so they can name brands or quote subject fragments.
+  - JSON keys aren't masked, so your own label names can appear in skip reasons.
+  - `./start.sh` prints the real address if demo mode is off at launch.
+  - Google's consent screens are never masked.
+- Report: `skip_reasons` covers all runs while `skipped_at_run_time` counts cleanup runs only. "Trashed, confirmed" includes messages later restored.
+- Full-run speed: each message is re-read before and after (plus a thread reply check), about 2-3 Gmail reads per message. There's no ETA on the run screen yet.
+- Maintenance view (optional) not built.
 - Mail-action scope: archive and trash only. Label, remove-label and mark-as-read actions not built.
 - Unsubscribe: display only (one-click vs manual counts); the flag is a loose check. Phase 4 needs exact RFC 8058 parsing.
 - Mock reset keeps old runs and audit rows; restoring an old run after a reset touches regenerated messages with the same ids (mock only).
@@ -128,6 +155,8 @@ Phase 4 gate **PASSED** on 2026-11-04. Next: `/phase-5` (waits for Nick).
 - npm 10 peer-resolution crash; `frontend/.npmrc` sets `legacy-peer-deps=true`.
 
 ## Test results
+2026-11-04 (Phase 5 gate): backend 330 passed, 0 failed, 0 skipped. Frontend: `tsc --noEmit` clean, `vite build` OK. Headless-Chrome click-through on a synthetic mailbox (ui-designer).
+Safety review: BLOCKING (masked demo addresses accepted as literals with demo off) + FAILs (List-Ids unmasked, 4-char mask collisions) fixed in 3e74cfd; re-check SAFE TO PROCEED. Executor, scopes and the LLM boundary are unchanged since Phase 4.
 2026-11-04 (Phase 4 gate): backend 322 passed, 0 failed, 0 skipped. Frontend: `tsc --noEmit` clean, `vite build` OK. Synthetic API smoke test passed.
 Safety review: SAFE TO PROCEED for the capped run; FAILs (writer account mismatch, unsubscribe of senders with protected mail, unlock surviving a wipe) fixed in 8c26df5; re-check SAFE; final live-DB check SAFE TO PROCEED. Open notes under Known issues.
 2026-11-04 (Phase 3 gate): backend 189 passed, 0 failed, 0 skipped. Frontend: `tsc --noEmit` clean, `vite build` OK.

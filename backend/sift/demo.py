@@ -22,7 +22,7 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+\-=]+@([A-Za-z0-9\-]+\.)+[A-Za-z]{2,}")
 DIGITS = re.compile(r"\d{6,}")  # order numbers, codes, phones; leaves dates and run labels readable
 HIDDEN = "[hidden in demo mode]"
 HASH_LEN = 8
-MASKED = re.compile(r"^.?\*\*\*[0-9a-f]{%d}@\S+$" % HASH_LEN)  # any string address() could have produced
+MASKED = re.compile(r"^.?\*\*\*[0-9a-f]{4,%d}@\S+$" % HASH_LEN)  # also the older 4-char masks from open tabs
 # Filter terms you typed yourself (Ask): shown and saved as typed.
 USER_TERMS = {"sender_contains", "subject_contains_any", "subject_excludes_any", "text", "query"}
 
