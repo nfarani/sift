@@ -1,14 +1,14 @@
 # PROGRESS
 
 ## Current phase
-Phase 2 gate **PASSED** on 2026-11-04. Next: `/phase-3` (waits for Nick).
+Phase 3 gate **PASSED** on 2026-11-04. Next: `/phase-4` (waits for Nick; fix the Phase 4 must-fix list first).
 
 ## Phase status
 | Phase | Status | Gate |
 |---|---|---|
 | 1. Mock end-to-end | done | PASSED 2026-11-03 (83/83 tests, safety re-audit: SAFE TO PROCEED) |
 | 2. Read-only Gmail | done | PASSED 2026-11-04 (113/113 tests; safety audit SAFE TO PROCEED; 500-message and full scans on Nick's account) |
-| 3. Claude classification + NL | not started | — |
+| 3. Claude classification + NL | done | PASSED 2026-11-04 (189/189 tests; safety audit BLOCKING → fixed in e00d2b8 → re-check SAFE TO PROCEED; live run on Nick's account, 20-sender spot-check OK) |
 | 4. First real modifications | not started | — |
 | 5. Full run, polish, demo | not started | — |
 
@@ -44,25 +44,36 @@ Phase 2 gate **PASSED** on 2026-11-04. Next: `/phase-3` (waits for Nick).
   - Full read-only scan: 98,981 messages (97,517 Inbox + 1,464 Sent) in 6h16m (4.4 msg/s), 0 errors, 2,940 senders, 5,200 protected.
   - Rules-only classification leaves 50,296 in "Needs your review".
 
+## Done (Phase 3)
+- ClaudeClassifier: unsettled sender groups only; Haiku 4.5 first pass, Opus 5.5 second opinion below 0.7 confidence. Strict JSON schema + client validation that rejects (never coerces); rejected batches keep their rules label. `test_claude.py`.
+- Prompt-injection hardening: escaped `<email_data>` JSON block, untrusted-data system prompt, no tools, protected subjects never sent. `test_claude.py`, `test_injection.py`.
+- Spend ledger and per-run hard cap (worst-case reservation per request, dearest price for fallbacks). The run must match the estimate the user approved. Within-cap runs cover only the groups the estimate covered, so each gets both passes (`test_within_cap_run_covers_only_estimated_groups_with_both_passes`).
+- NL planner: sentence → validated filter spec → local preview → editable recommendation; it can't create or approve plans.
+- Protection additions (from the Phase 3 spot-check): trip/order receipts ("Your Sunday trip with Uber", "…order with Uber Eats") and Portuguese receipt/travel/security/finance terms. On the real scan this newly protects 661 messages (Uber/Free Now receipts, ~100 Google "Alerta de segurança"/"Novo login"), with ~5 harmless false positives (promos kept). Stored flags are re-derived at startup when the rule set changes. `test_protection.py`, `test_startup_reapplies_protection_when_builtin_rules_changed`.
+- Gate fixes (e00d2b8): unknown connect errors show a fixed message; disconnect/account switch also clears Claude labels and runs (spend totals kept, detail text dropped); startup refresh uses the cached address and can't crash startup; interrupted AI runs marked failed on restart; planner reserves worst case; strict keep-exception reason; run screen counts senders, not batches. Tests in `test_api.py`.
+- Tests no longer read the real ANTHROPIC_API_KEY from `.env` (`conftest.py`).
+- Live results on Nick's account (2026-11-04):
+  - Run 1 cancelled by me after 80 senders ($0.09): it was sweeping all 2,536 senders instead of the 655 the estimate covered (fixed, ee7f9a9).
+  - Run 2: 657 senders, completed, $0.54. Total spend $0.63. 677 senders labelled by Claude. "Needs your review" went from 50,296 to 7,184 messages.
+  - 4 batches (80 senders) rejected, all for "keep_exception phrase must be 4-60 characters". Only 2 senders got the Opus second opinion.
+  - Nick spot-checked the 20 biggest senders: "pretty much correct", no misclassifications reported.
+
 ## Next
-- `/phase-3`: Claude classification for the ~50k unsettled messages / ~2,900 senders. Estimate tokens and cost first and wait for Nick's OK.
-- Known rules-only misfiles to check in Phase 3:
-  - Guardian Jobs → employment (should be job alerts).
-  - LinkedIn Job Alerts, Feedspot, recruit.net → review.
-  - Revolut and Uber → notifications (should be finance/receipts, though their transactional mail is protected individually).
-  - ChatGPT and Jobscan → job alerts.
-- Nick: click through http://127.0.0.1:5173 (`./start.sh`) to confirm the gate's manual check.
-- `/phase-2`: GmailProvider (read-only). Must do first: S1, S6 below.
+- Nick: restart with `./start.sh --gmail` so the new protection rules apply to the stored scan.
+- `/phase-4`: first real modifications. Fix the "Must fix before Phase 4" list below first, starting with items 1-5 and 14.
 
 ## Known issues
-**Fixed in Phase 2 (2a8a70d, not yet safety-reviewed)**
-- S1: MailReader and MailWriter are now split; in Gmail mode no writer exists at all.
-- S6: label rules now resolve names to label IDs; Cc/Bcc recipients now count as people you've emailed.
-
-**Must fix before Phase 3**
-- Snippets (up to 200 chars of body preview) will go to Anthropic. Keep minimal, show in UI. Disclosure copy now says so (fixed 2026-11-04).
-- Map connection errors to fixed messages instead of raw `str(e)` in /api/status (precaution).
-- S7: classifier output is coerced to `uncertain` on unknown categories. It needs strict schema validation that rejects, plus confidence bounds.
+**Open from the Phase 3 safety review** (not blocking for Phase 3; the executor-related ones block Phase 4):
+- P3-5: failed Anthropic calls aren't recorded in the ledger, and the SDK retries up to 3 times, so the cap and "Usage to date" can understate spend after timeouts/5xx. Fix: `max_retries=0` with a ledger check before each own retry, or record a reservation-sized row on exception.
+- P3-9: one too-short keep_exception phrase throws away a whole batch of 20. Reject per group instead (still never coerce), and show the stored reason in the UI.
+- P3-10: second opinions almost never happen (Haiku reports ≥0.7 on nearly everything). Also send the biggest disposable-labelled groups to the review model.
+- P3-11: the spend cap is per run, not cumulative. Say "per run" in the UI and README, and optionally add a total cap.
+- P3-12: the input-token reservation is a chars/3.5 estimate; non-Latin text can overshoot by cents. Use `count_tokens`.
+- P3-14: the Ask panel keeps showing Claude's explanation after the filter fields are edited.
+- P3-15: rule add/delete runs `_reanalyse` synchronously and can race a newly submitted job. Use a single analysis lock.
+- P3-16: tests still load the other `.env` values (`SIFT_*`); also delenv them in the autouse fixture.
+- `providers/gmail.py:85` passes unknown exceptions through unchanged (they no longer reach the UI as text).
+- `apply_protection` records the rules version before aggregate/classify finish. If startup fails in that window, it won't retry, and sender groups can be half-rebuilt. Mail is still safe because the executor re-checks protection.
 
 **Must fix before Phase 4 (first real modification)**, from the safety re-audit, most severe first:
 1. "Sender you've emailed" isn't re-checked at run time (only threads are). There's also no maximum scan age. Add a fresh sent-since-scan check or refuse stale scans.
@@ -88,8 +99,9 @@ Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_tes
 - Mock reset keeps old runs and audit rows; restoring an old run after a reset touches regenerated messages with the same ids (mock only).
 - No frontend unit tests; UI covered by typecheck/build and a manual headless click-through.
 - npm 10 peer-resolution crash; `frontend/.npmrc` sets `legacy-peer-deps=true`.
-- Rule classifier puts "Food for Thought" (a recipe newsletter in Gmail's Promotions tab) under promotions. Expected rules-only imprecision; revisit with Claude in Phase 3.
 
 ## Test results
+2026-11-04 (Phase 3 gate): backend 189 passed, 0 failed, 0 skipped. Frontend: `tsc --noEmit` clean, `vite build` OK.
+Safety review: first audit BLOCKING (raw connect error text in /api/status; disconnect left Claude labels behind) plus FAILs 3, 4, 6, 7, 13. All fixed in e00d2b8 and a follow-up. Re-check: SAFE TO PROCEED. Remaining findings listed under Known issues.
 2026-11-03: backend 83 passed, 0 failed, 0 skipped (`cd backend && .venv/bin/python -m pytest`). Frontend: `tsc --noEmit` clean, `vite build` OK. No frontend unit tests.
 Safety review: first audit BLOCKING (B1 trash of re-filed mail, B2 replies after approval, B3 no CSRF/rebinding guard). All three fixed in 6f44f8a with regression tests. Re-audit: SAFE TO PROCEED for Phase 1.

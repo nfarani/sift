@@ -745,7 +745,7 @@ def create_app(state: State) -> FastAPI:
     if db.get_setting("protection.rules_version") != RULES_VERSION and not state.jobs.busy():
         with db.connect() as c:
             has_scan = c.execute("SELECT 1 FROM messages LIMIT 1").fetchone() is not None
-        if has_scan and account():
+        if has_scan and (db.get_setting("account.email") or state.settings.provider != "gmail"):
             try:
                 _reanalyse()  # apply_protection records the rules version
             except Exception as e:  # never block startup; the executor re-checks protection at run time anyway
