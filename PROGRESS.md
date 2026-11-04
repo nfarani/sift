@@ -60,7 +60,7 @@ Phase 2 in progress (code done, commit 2a8a70d, 104 tests pass). Waiting on:
 Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_test_scan_cannot_drive_cleanup`).
 
 **Other**
-- Demo mode (PII masking) not built (Phase 5).
+- Demo mode (PII masking) not built (Phase 5). It must mask: your own address (header chip, Overview subtitle, Account page, `./start.sh` "Mailbox:" line), sender names and addresses, subjects/snippets, and person names in display names. Build it before recording the Phase 4 run for publishing.
 - Mail-action scope: archive and trash only. Label, remove-label and mark-as-read actions not built.
 - Unsubscribe: display only (one-click vs manual counts); the flag is a loose check. Phase 4 needs exact RFC 8058 parsing.
 - Mock reset keeps old runs and audit rows; restoring an old run after a reset touches regenerated messages with the same ids (mock only).
