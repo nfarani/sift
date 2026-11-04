@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Current phase
-Phase 3 gate **PASSED** on 2026-11-04. Next: `/phase-4` (waits for Nick; fix the Phase 4 must-fix list first).
+Phase 4 gate: all checks met except Nick's look in Gmail (2026-11-04). Then `/phase-5` (waits for Nick).
 
 ## Phase status
 | Phase | Status | Gate |
@@ -9,7 +9,7 @@ Phase 3 gate **PASSED** on 2026-11-04. Next: `/phase-4` (waits for Nick; fix the
 | 1. Mock end-to-end | done | PASSED 2026-11-03 (83/83 tests, safety re-audit: SAFE TO PROCEED) |
 | 2. Read-only Gmail | done | PASSED 2026-11-04 (113/113 tests; safety audit SAFE TO PROCEED; 500-message and full scans on Nick's account) |
 | 3. Claude classification + NL | done | PASSED 2026-11-04 (189/189 tests; safety audit BLOCKING → fixed in e00d2b8 → re-check SAFE TO PROCEED; live run on Nick's account, 20-sender spot-check OK) |
-| 4. First real modifications | not started | — |
+| 4. First real modifications | done | 2026-11-04: 322/322 tests; safety audit SAFE TO PROCEED (3 FAILs fixed in 8c26df5, re-checked); live 50-message run + restore 50/50 confirmed by re-read and DB audit; NEEDS NICK: visual check in Gmail |
 | 5. Full run, polish, demo | not started | — |
 
 ## Done (Phase 1, each verified by a test or a manual check)
@@ -58,9 +58,41 @@ Phase 3 gate **PASSED** on 2026-11-04. Next: `/phase-4` (waits for Nick; fix the
   - 4 batches (80 senders) rejected, all for "keep_exception phrase must be 4-60 characters". Only 2 senders got the Opus second opinion.
   - Nick spot-checked the 20 biggest senders: "pretty much correct", no misclassifications reported.
 
+## Done (Phase 4)
+- Executor must-fixes 1-14 (2d12e52, 8c26df5), each with a test in `test_executor.py` / `test_plans.py` / `test_protection.py`:
+  - fresh sent-since-scan check and a 7-day maximum scan age
+  - archive skips mail already in Trash
+  - restore and unlock keyed on attempted (write-ahead) changes
+  - one capped, single-recommendation run until a full restore; the proof resets on disconnect or account switch
+  - the idempotency shortcut is audited (`already_done`) and flags newly protected mail
+  - final plan states; frozen message lists; plans refused if approved while read-only or built from an older analysis
+  - `unread_only` re-checked; writer required in run/restore; writer must be the same account
+  - nested label rules; the wipe can't fail with runs present; cap clamped to 1-50; the writer never changes UNREAD
+- Cleanup permission: a separate Keychain writer token with gmail.modify. The reader stays gmail.readonly.
+  - GmailWriter has no delete/send/draft. Scopes are re-checked after every refresh. Corrupt Keychain entries are survived.
+  - Enable/disable cleanup routes. `test_gmail.py`.
+- Unsubscribe: exact RFC 8058 one-click parsing.
+  - Frozen batches with their own hash-echo approval, plus a separate execute step.
+  - SSRF-safe single POST without redirects; append-only log (host only); mailto shown as manual.
+  - Senders you've emailed, protect, or have protected mail from are skipped. `test_unsubscribe.py`.
+  - Not used on the real account yet.
+- UI (f256589, 447ed16): Enable cleanup explanation screen, one-recommendation first-run picker, attempted vs confirmed, restore and unlock, unsubscribe batches, backend refusals shown verbatim.
+- Synthetic end-to-end smoke test (API), each step behaving as expected:
+  - two-recommendation first run refused
+  - capped run 50/50
+  - second capped run refused
+  - unlock refused before restore
+  - restore 50/50, then unlock OK
+- **Live on Nick's account (2026-11-04):**
+  - Cleanup enabled 14:40.
+  - Run #1: "advertising", capped: 50 attempted, 50 confirmed, 0 failed, label `Sift/2026-11-04-run-1`. Inbox 97,517 → 97,467.
+  - Run #2 (restore of #1): 50 attempted, 50 confirmed, 0 failed. Inbox back to 97,517.
+  - Safety check of the live DB: same 50 ids, all in the plan, none protected, no UNREAD or Trash changes.
+
 ## Next
-- Nick: restart with `./start.sh --gmail` so the new protection rules apply to the stored scan.
-- `/phase-4`: first real modifications. Fix the "Must fix before Phase 4" list below first, starting with items 1-5 and 14.
+- Nick: confirm in Gmail that the label `Sift/2026-11-04-run-1` is empty and the 50 messages are back in the Inbox; click "Unlock full runs".
+- `/phase-5`: full run, polish, demo mode (build PII masking before recording anything for publishing).
+- Ask Nick before the first real unsubscribe batch.
 
 ## Known issues
 **Open from the Phase 3 safety review** (not blocking for Phase 3; the executor-related ones block Phase 4):
@@ -75,22 +107,17 @@ Phase 3 gate **PASSED** on 2026-11-04. Next: `/phase-4` (waits for Nick; fix the
 - `providers/gmail.py:85` passes unknown exceptions through unchanged (they no longer reach the UI as text).
 - `apply_protection` records the rules version before aggregate/classify finish. If startup fails in that window, it won't retry, and sender groups can be half-rebuilt. Mail is still safe because the executor re-checks protection.
 
-**Must fix before Phase 4 (first real modification)**, from the safety re-audit, most severe first:
-1. "Sender you've emailed" isn't re-checked at run time (only threads are). There's also no maximum scan age. Add a fresh sent-since-scan check or refuse stale scans.
-2. Archive action lets messages already in Trash through revalidation (`executor.py` `_revalidate`: the TRASH exemption should apply to trash actions only). It labels them and reports them as confirmed.
-3. Changes from a crashed or unconfirmed run can't be restored from the UI (Restore button needs `confirmed > 0`). Key on `attempted` audit rows; review `unlock_full_runs` too.
-4. The first-run cap applies per run; repeated capped runs need no unlock. Decide: one capped run until unlock.
-5. The idempotency shortcut (own run label already applied) writes no audit row and doesn't flag a now-protected message.
-6. DB hardening: block cancelled/completed → approved, and DELETE on `plan_messages` once a plan leaves draft.
-7. (Phase 2 review P4-b) Plans approved while read-only stay approved; require approval after cleanup is enabled.
-8. (P4-c) Once gmail.modify is granted, the reader's token can modify too. Use a separate writer token, or record this as an accepted deviation; re-check scopes after refresh.
-9. (P4-d) Label rules resolve through labels.map from the last scan (can be stale); nested labels ("Work/Clients") aren't matched by "Work".
-10. (P4-e) Check that disconnect can't fail midway once runs exist (it currently wipes plans).
-11. Executor.run()/restore() should call `_require_writer()` themselves (defence in depth).
-12. Disconnect/startup should survive a corrupt Keychain entry (load raises before delete).
-13. Exact RFC 8058 parsing for one-click unsubscribe before building unsubscribe.
-14. (Phase 3 review) Executor doesn't recheck the local category or `unread_only` against the plan item. A Claude run or reclassification between approval and execution doesn't stop the plan. Fix: revalidate category/UNREAD, or block execution when an AI run finished after approval.
-Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_test_scan_cannot_drive_cleanup`).
+**Open from the Phase 4 safety review** (none blocking; the reviewer gave SAFE TO PROCEED):
+- P4-4: when a refresh comes back with drifted scopes, `fresh()` deletes the stored token but the refreshed object stays usable in memory for the rest of that call. Set `creds.token = None` before raising.
+- P4-5: a run message that can never be restored (deleted, or Trash emptied) keeps the cap locked for good. Add an audited "accept as unrecoverable" path.
+- P4-6: `_refresh_sent` stops at the first page with a known id; sent mail listed out of date order (scheduled, imported) can be missed. Thread replies are still checked per chunk.
+- P4-8: the no-network test guard is autouse only in `test_gmail.py`; move it to `conftest.py` with a socket block. No test touches the network today.
+- P4-10: unsubscribe `run_batch` doesn't re-check, at execute time, whether a sender has become someone you've emailed since approval.
+- P4-11: on reconnect, `_reattach_writer` revokes cleanup on a transient network error, which can also end the read-only sign-in. Revoke only on an account mismatch.
+- P4-13: no test for the `unread_only` re-check.
+- P4-14: after a reader token refresh, check by hand that it still reports only gmail.readonly. If not, Sift fails safe but asks to reconnect.
+- Disabling cleanup may also sign out read-only access (Google ties tokens to the user's grant for the project); the UI says so.
+- Unsubscribe can't verify DKIM over the List-Unsubscribe headers (metadata only); the per-batch approval is the safeguard.
 
 **Other**
 - Demo mode (PII masking) not built (Phase 5). It must mask: your own address (header chip, Overview subtitle, Account page, `./start.sh` "Mailbox:" line), sender names and addresses, subjects/snippets, and person names in display names. Build it before recording the Phase 4 run for publishing.
@@ -101,6 +128,8 @@ Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_tes
 - npm 10 peer-resolution crash; `frontend/.npmrc` sets `legacy-peer-deps=true`.
 
 ## Test results
+2026-11-04 (Phase 4 gate): backend 322 passed, 0 failed, 0 skipped. Frontend: `tsc --noEmit` clean, `vite build` OK. Synthetic API smoke test passed.
+Safety review: SAFE TO PROCEED for the capped run; FAILs (writer account mismatch, unsubscribe of senders with protected mail, unlock surviving a wipe) fixed in 8c26df5; re-check SAFE; final live-DB check SAFE TO PROCEED. Open notes under Known issues.
 2026-11-04 (Phase 3 gate): backend 189 passed, 0 failed, 0 skipped. Frontend: `tsc --noEmit` clean, `vite build` OK.
 Safety review: first audit BLOCKING (raw connect error text in /api/status; disconnect left Claude labels behind) plus FAILs 3, 4, 6, 7, 13. All fixed in e00d2b8 and a follow-up. Re-check: SAFE TO PROCEED. Remaining findings listed under Known issues.
 2026-11-03: backend 83 passed, 0 failed, 0 skipped (`cd backend && .venv/bin/python -m pytest`). Frontend: `tsc --noEmit` clean, `vite build` OK. No frontend unit tests.
