@@ -135,6 +135,14 @@ def build_state(settings: Settings, provider: MailReader | None = None, retry: R
     return state
 
 
+def public_error(e: Exception) -> str:
+    """Text safe to show in the UI. Our own error types carry fixed, authored messages; anything else
+    (library or network exceptions) is reduced to a fixed sentence plus its type name."""
+    if isinstance(e, (AuthError, ProviderError)):
+        return str(e)[:300]
+    return f"Could not connect to Gmail ({type(e).__name__}). Check your network and try again."
+
+
 def _attach_ai(state: State, client=None) -> None:
     """Claude is optional. Without a key the app runs rules-only and says so; it never fakes AI output."""
     s = state.settings
@@ -273,7 +281,7 @@ def create_app(state: State) -> FastAPI:
                 state.connection = {"state": "connected", "error": None}
             except Exception as e:  # message only, never tokens
                 log.warning("gmail connect failed: %s", type(e).__name__)
-                state.connection = {"state": "error", "error": f"{type(e).__name__}: {e}"[:300]}
+                state.connection = {"state": "error", "error": public_error(e)}
 
         with connect_lock:
             if state.connection["state"] == "connecting":
@@ -589,7 +597,7 @@ def create_app(state: State) -> FastAPI:
 
     # -- protection rules -----------------------------------------------------
     def _reanalyse():
-        user = need_reader().account_email()
+        user = account() or need_reader().account_email()  # cached address first: no Gmail call
         apply_protection(db, user)
         groups = aggregate(db, user)
         classify(db, state.classifier, groups)
@@ -740,7 +748,7 @@ def create_app(state: State) -> FastAPI:
         if has_scan and account():
             try:
                 _reanalyse()  # apply_protection records the rules version
-            except ProviderError as e:
+            except Exception as e:  # never block startup; the executor re-checks protection at run time anyway
                 log.warning("protection refresh postponed: %s", type(e).__name__)
         elif not has_scan:
             db.set_setting("protection.rules_version", RULES_VERSION)

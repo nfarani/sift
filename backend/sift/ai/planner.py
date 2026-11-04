@@ -11,7 +11,7 @@ import json
 
 from ..classifier.base import CATEGORIES
 from ..query import ACTIONS, MODES, Spec, SpecError, parse_spec
-from .ledger import Ledger, cost, estimate_tokens
+from .ledger import MOST_EXPENSIVE, Ledger, cost, estimate_tokens
 
 SYSTEM = f"""You turn one request about the user's email inbox into a filter specification for an inbox-cleanup app.
 You only produce the specification. The app shows it to the user, counts matches with plain code, and the
@@ -75,7 +75,8 @@ class QueryPlanner:
         today = today or dt.date.today()
         user = (f"Today is {today.isoformat()}.\n<user_request>\n"
                 f"{text.replace('<', '‹').replace('>', '›')}\n</user_request>")
-        self.ledger.check_single(cost(self.model, estimate_tokens(SYSTEM + user) + 400, 3000))
+        # Worst case: every output token used, possibly served by a pricier fallback model.
+        self.ledger.check_single(cost(MOST_EXPENSIVE, estimate_tokens(SYSTEM + user) + 400, 8000))
         kwargs = dict(model=self.model, max_tokens=8000, system=SYSTEM, messages=[{"role": "user", "content": user}],
                       output_config={"format": {"type": "json_schema", "schema": SPEC_SCHEMA}, "effort": "low"})
         if self.model.startswith("claude-opus-5"):

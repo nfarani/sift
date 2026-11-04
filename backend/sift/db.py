@@ -302,8 +302,11 @@ class Database:
             )
 
     def wipe_analysis(self) -> None:
-        """Clear scanned data and plans (used when the mock mailbox is regenerated). Audit log is kept."""
+        """Clear scanned data, plans and Claude labels (mock reset, disconnect, account switch).
+        The audit log and the spend ledger (tokens and cost only) are kept."""
         with self.tx() as c:
-            for t in ("plan_messages", "plans", "recommendations", "sender_groups", "messages", "scans"):
+            for t in ("plan_messages", "plans", "recommendations", "sender_groups", "messages", "scans",
+                      "ai_labels", "ai_runs"):
                 c.execute(f"DELETE FROM {t}")
+            c.execute("UPDATE ai_usage SET detail=NULL")  # keep the spend record, drop any text about senders
             c.execute("DELETE FROM settings WHERE key LIKE 'cleanup.%' OR key='labels.map'")

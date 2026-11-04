@@ -149,3 +149,46 @@ def test_startup_reapplies_protection_when_builtin_rules_changed(tmp_path, provi
     create_app(build_state(s, provider=provider, retry=retry))
     with db.connect() as x:
         assert x.execute("SELECT protected FROM messages WHERE id=?", (mid,)).fetchone()[0] == 1
+
+
+def test_startup_never_crashes_when_protection_refresh_fails(tmp_path, provider, retry, monkeypatch):
+    c, state = client.__wrapped__(tmp_path, provider, retry)
+    assert c.post("/api/scan").status_code == 200
+    wait(c, "/api/scan")
+    state.db.set_setting("protection.rules_version", "old")
+    import sift.api as api_mod
+    def offline(*a, **k):
+        raise OSError("network down")
+    monkeypatch.setattr(api_mod, "apply_protection", offline)
+    s = Settings(); s.data_dir = tmp_path; s.extra_allowed_hosts = ("testserver",)
+    create_app(build_state(s, provider=provider, retry=retry))  # must not raise
+    assert state.db.get_setting("protection.rules_version") == "old"  # retried on the next start
+
+
+def test_unknown_connect_errors_show_a_fixed_message():
+    from sift.api import public_error
+    from sift.providers.gmail_auth import AuthError
+    assert "secret-ish detail" not in public_error(RuntimeError("secret-ish detail"))
+    assert "RuntimeError" in public_error(RuntimeError("x"))
+    assert public_error(AuthError("Gmail read access was not granted")) == "Gmail read access was not granted"
+
+
+def test_wipe_clears_claude_labels_and_runs_but_keeps_spend(db):
+    with db.connect() as c:
+        c.execute("INSERT INTO ai_labels VALUES ('a@x.test','promotions',0.9,'r','[]','m','t')")
+        c.execute("INSERT INTO ai_runs(status,started_at,cap_usd) VALUES ('completed','t',2)")
+        c.execute("INSERT INTO ai_usage(ts,purpose,model,cost_usd,ok,detail) VALUES ('t','classify_bulk','m',0.1,0,'rejected: x')")
+    db.wipe_analysis()
+    with db.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM ai_labels").fetchone()[0] == 0
+        assert c.execute("SELECT COUNT(*) FROM ai_runs").fetchone()[0] == 0
+        assert tuple(c.execute("SELECT cost_usd, detail FROM ai_usage").fetchone()) == (0.1, None)
+
+
+def test_interrupted_ai_run_is_marked_failed_on_restart(db):
+    from sift.jobs import recover_interrupted
+    with db.connect() as c:
+        c.execute("INSERT INTO ai_runs(status,started_at,cap_usd) VALUES ('running','t',2)")
+    recover_interrupted(db)
+    with db.connect() as c:
+        assert tuple(c.execute("SELECT status, error FROM ai_runs").fetchone()) == ("failed", "interrupted by restart")

@@ -52,7 +52,7 @@ export default function Claude({ go }: { go: (r: string) => void }) {
           <div className="stats stats-4">
             <Mini label="Senders labelled" value={`${n(run.groups_done)} / ${n(run.groups_total)}`} />
             <Mini label="Spent so far" value={usd(run.cost_usd)} hint={`cap ${usd(run.cap_usd)}`} />
-            <Mini label="Rejected batches" value={n(run.groups_failed)} hint="kept their rules label" />
+            <Mini label="Senders in rejected batches" value={n(run.groups_failed)} hint="kept their rules label" />
             <Mini label="Second opinions" value={n(run.groups_reviewed)} />
           </div>
           <div className="row end"><button className="btn btn-ghost" onClick={() => api.post("/ai/run/cancel").then(reload)}>Cancel</button></div>
@@ -65,7 +65,7 @@ export default function Claude({ go }: { go: (r: string) => void }) {
           <table className="table"><tbody>
             <tr><td>Senders labelled by Claude</td><td className="num">{n(run.groups_done)} of {n(run.groups_total)}</td></tr>
             <tr><td>Got a second opinion from the stronger model</td><td className="num">{n(run.groups_reviewed)}</td></tr>
-            <tr><td>First-pass batches rejected or failed (kept rules label)</td><td className="num">{n(run.groups_failed)}</td></tr>
+            <tr><td>Senders in rejected or failed first-pass batches (kept rules label)</td><td className="num">{n(run.groups_failed)}</td></tr>
             <tr><td>Cost</td><td className="num"><strong>{usd(run.cost_usd)}</strong> <span className="muted">(cap {usd(run.cap_usd)}, estimated {usd(run.estimate.usd)})</span></td></tr>
           </tbody></table>
           {run.status === "stopped_at_cap" && <div className="notice notice-cap">Stopped at your spend cap. Unlabelled senders keep their rules label; run again later to continue (labels so far are kept and not paid for twice).</div>}

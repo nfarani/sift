@@ -166,8 +166,10 @@ def validate(raw: str, n_groups: int, model: str, groups: list[GroupInput]) -> l
                 raise InvalidOutput("keep_exception phrase must be 4-60 characters")
             if e["category"] not in KEEP:
                 raise InvalidOutput("keep_exceptions may only point to keep categories")
+            if not isinstance(e["reason"], str) or not 1 <= len(e["reason"].strip()) <= 200:
+                raise InvalidOutput("keep_exception reason must be 1-200 characters")
             clean.append({"subject_contains": phrase.strip(), "category": e["category"],
-                          "reason": str(e["reason"])[:200]})
+                          "reason": e["reason"].strip()})
         seen[i] = Label(groups[i].sender, cat, float(conf), reason.strip(), clean, model)
     if len(seen) != n_groups:
         raise InvalidOutput(f"expected {n_groups} results, got {len(seen)}")

@@ -47,3 +47,5 @@ def recover_interrupted(db: Database) -> None:
         c.execute("UPDATE runs SET status='failed', error=COALESCE(error,'interrupted by restart'), finished_at=? "
                   "WHERE status='running'", (now_iso(),))
         c.execute("UPDATE plans SET status='partial' WHERE status='running'")
+        c.execute("UPDATE ai_runs SET status='failed', error=COALESCE(error,'interrupted by restart'), finished_at=? "
+                  "WHERE status='running'", (now_iso(),))
