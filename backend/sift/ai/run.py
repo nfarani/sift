@@ -11,11 +11,12 @@ from ..db import Database, now_iso
 
 
 def candidates(db: Database) -> list[GroupInput]:
-    """Sender groups worth sending to Claude, biggest first.
+    """Sender groups sent to Claude, biggest first: everything the rules didn't firmly settle, including
+    groups the rules labelled but may have misfiled.
 
-    Settled by rules (never sent): senders you've corresponded with ("personal"), finance/security senders
-    whose mail is mostly protected anyway, senders with nothing left to act on, and senders already
-    labelled by Claude (cached). Minimal samples only: 6 subjects + 3 snippets of <=160 chars.
+    Never sent: senders you've corresponded with ("personal"), finance/security senders whose mail is mostly
+    protected anyway, senders with nothing left to act on, and senders already labelled by Claude (cached).
+    Minimal samples only, and only from unprotected messages: 6 subjects + 3 snippets of <=160 chars.
     """
     with db.connect() as c:
         rows = c.execute(
@@ -29,7 +30,7 @@ def candidates(db: Database) -> list[GroupInput]:
         out = []
         for g in rows:
             subj = [r[0] for r in c.execute(
-                "SELECT subject FROM messages WHERE from_addr=? AND is_sent=0 GROUP BY subject "
+                "SELECT subject FROM messages WHERE from_addr=? AND is_sent=0 AND protected=0 GROUP BY subject "
                 "ORDER BY MAX(internal_date) DESC LIMIT 6", (g["sender"],))]
             snip = [r[0] for r in c.execute(
                 "SELECT snippet FROM messages WHERE from_addr=? AND is_sent=0 AND protected=0 AND snippet != '' "
@@ -83,12 +84,14 @@ def run(db: Database, clf: ClaudeClassifier, run_id: int, user_email: str) -> st
         with db.connect() as c:
             return bool(c.execute("SELECT cancel_requested FROM ai_runs WHERE id=?", (run_id,)).fetchone()[0])
 
-    labels, stats = clf.classify(groups, run_id, progress, cancelled)
-    with db.tx() as c:
-        for lab in labels.values():
-            c.execute("INSERT OR REPLACE INTO ai_labels VALUES (?,?,?,?,?,?,?)",
-                      (lab.sender, lab.category, lab.confidence, lab.reason, json.dumps(lab.exceptions),
-                       lab.model, now_iso()))
+    def save(batch):  # persist each accepted batch at once, so paid-for labels survive a later failure
+        with db.tx() as c:
+            for lab in batch:
+                c.execute("INSERT OR REPLACE INTO ai_labels VALUES (?,?,?,?,?,?,?)",
+                          (lab.sender, lab.category, lab.confidence, lab.reason, json.dumps(lab.exceptions),
+                           lab.model, now_iso()))
+
+    labels, stats = clf.classify(groups, run_id, progress, cancelled, on_batch=save)
     # Re-apply rules + Claude labels, then rebuild recommendations.
     rules = RuleOnlyClassifier()
     classify(db, rules, aggregate(db, user_email))
@@ -96,6 +99,7 @@ def run(db: Database, clf: ClaudeClassifier, run_id: int, user_email: str) -> st
     status = ("cancelled" if stats["cancelled"] else "stopped_at_cap" if stats["stopped_at_cap"] else "completed")
     with db.connect() as c:
         c.execute("UPDATE ai_runs SET status=?, finished_at=?, groups_done=?, groups_failed=?, groups_reviewed=?, "
-                  "cost_usd=?, current_op='finished' WHERE id=?",
-                  (status, now_iso(), len(labels), stats["failed"], stats["reviewed"], clf.ledger.spent(run_id), run_id))
+                  "cost_usd=?, current_op='finished', error=? WHERE id=?",
+                  (status, now_iso(), len(labels), stats["failed"], stats["reviewed"], clf.ledger.spent(run_id),
+                   "; ".join(stats["errors"][:3]) or None, run_id))
     return status

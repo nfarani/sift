@@ -206,9 +206,10 @@ class ClaudeClassifier:
     # -- calls ----------------------------------------------------------------
     def _call(self, model: str, groups: list[GroupInput], run_id: int | None, purpose: str) -> list[Label]:
         est_in = estimate_tokens(SYSTEM_PROMPT) + 400 + estimate_tokens(render_data(groups))
-        est_out = 4000 if model == self.review_model else 120 * len(groups)
-        self.ledger.check(run_id, cost(model, est_in, est_out))  # raises SpendCapReached
-        kwargs = dict(model=model, max_tokens=16000 if model == self.review_model else 4096,
+        max_tokens = 8000 if model == self.review_model else 4096
+        # Reserve the worst case (every output token used) so one request can never overshoot the cap.
+        self.ledger.check(run_id, cost(model, est_in, max_tokens))  # raises SpendCapReached
+        kwargs = dict(model=model, max_tokens=max_tokens,
                       system=SYSTEM_PROMPT, messages=[{"role": "user", "content": render_data(groups)}],
                       output_config={"format": {"type": "json_schema", "schema": RESULT_SCHEMA}})
         if model.startswith("claude-opus-5") or model.startswith("claude-sonnet-5"):
@@ -237,11 +238,13 @@ class ClaudeClassifier:
 
     def classify(self, groups: list[GroupInput], run_id: int | None = None,
                  progress: Callable[[str, int, int, int], None] | None = None,
-                 cancelled: Callable[[], bool] = lambda: False) -> tuple[dict[str, Label], dict]:
+                 cancelled: Callable[[], bool] = lambda: False,
+                 on_batch: Callable[[list[Label]], None] | None = None) -> tuple[dict[str, Label], dict]:
         """Returns ({sender: Label}, stats). Groups whose batch was rejected or not reached are absent:
         they keep their rules label. Raises nothing for invalid output; SpendCapReached stops the run."""
         out: dict[str, Label] = {}
-        stats = {"failed": 0, "reviewed": 0, "stopped_at_cap": False, "cancelled": False}
+        stats = {"failed": 0, "review_failed": 0, "reviewed": 0, "stopped_at_cap": False, "cancelled": False,
+                 "errors": []}
 
         def run_pass(model, gs, batch, purpose):
             for i in range(0, len(gs), batch):
@@ -251,15 +254,27 @@ class ClaudeClassifier:
                 part = gs[i:i + batch]
                 if progress:
                     progress(purpose, i, len(gs), len(out))
+                key = "failed" if purpose == "classify_bulk" else "review_failed"
                 try:
-                    for lab in self._call(model, part, run_id, purpose):
-                        out[lab.sender] = lab
+                    labs = self._call(model, part, run_id, purpose)
                 except SpendCapReached:
                     stats["stopped_at_cap"] = True
                     return
                 except InvalidOutput as e:
                     log.warning("rejected %s batch (%d groups): %s", purpose, len(part), e)
-                    stats["failed"] += len(part)
+                    stats[key] += len(part)
+                    continue
+                except Exception as e:  # API/network error after the SDK's own retries: skip this batch only
+                    if type(e).__module__.split(".")[0] != "anthropic":
+                        raise
+                    log.warning("%s batch failed: %s", purpose, type(e).__name__)
+                    stats[key] += len(part)
+                    stats["errors"].append(f"{type(e).__name__}")
+                    continue
+                for lab in labs:
+                    out[lab.sender] = lab
+                if on_batch:
+                    on_batch(labs)
 
         run_pass(self.bulk_model, groups, self.bulk_batch, "classify_bulk")
         if stats["stopped_at_cap"] or stats["cancelled"]:

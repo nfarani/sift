@@ -1,6 +1,8 @@
 """Token accounting and the hard spend cap. Every Anthropic call is recorded here, accepted or not."""
 from __future__ import annotations
 
+import re
+
 from ..db import Database, now_iso
 
 # USD per million tokens. Checked 2026-11-04 against the claude-api skill's model table.
@@ -64,7 +66,8 @@ class Ledger:
         cr = getattr(usage, "cache_read_input_tokens", 0) or 0
         cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
         # A fallback may have served the request; price by the serving model, or the dearest known one.
-        served = model if model in PRICES else MOST_EXPENSIVE
+        base = re.sub(r"-\d{8}$", "", model or "")  # e.g. claude-haiku-4-5-20251001 -> claude-haiku-4-5
+        served = model if model in PRICES else base if base in PRICES else MOST_EXPENSIVE
         usd = cost(served, it, ot, cr, cw)
         with self.db.connect() as c:
             c.execute("INSERT INTO ai_usage(ts,run_id,purpose,model,input_tokens,output_tokens,cache_read_tokens,"

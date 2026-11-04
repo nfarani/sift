@@ -57,7 +57,7 @@ export default function Ask({ available, reason, onSaved }: { available: boolean
             <button className="btn btn-primary" disabled={busy || text.trim().length < 3} onClick={plan}>{busy && !spec ? "Thinking…" : "Turn into a filter"}</button>
           </div>
           {!spec && <div className="ask-examples">{EXAMPLES.map((x) => <button key={x} className="chip-btn" onClick={() => setText(x)}>{x}</button>)}</div>}
-          <p className="muted small">Only your sentence and today's date are sent to Claude, never your mail. Claude can't act on anything: you'll see the filter and the exact count first.</p>
+          <p className="muted small">Only your sentence and today's date are sent to Claude, never your mail; each request costs about one cent and shows in Claude → Usage. Claude can't act on anything: you'll see the filter and the exact count first.</p>
         </>
       )}
       {saved && <div className="notice notice-cap">Saved “{saved}” as a recommendation below. Select it like any other to build a plan.</div>}

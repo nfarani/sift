@@ -241,7 +241,7 @@ function RecCard({ rec, choice, onChange, onProtect, senderQ, onRemove }: {
                       {s.classifier && <div className={`src ${s.classifier.startsWith("claude") ? "src-claude" : ""}`} title={s.reason ?? ""}>
                         {s.classifier.startsWith("claude") ? "Claude" : "Rules"}{s.reason ? ` · ${s.reason}` : ""}</div>}</td>
                     <td className="num">{excluded ? "—" : n(s.eligible)}</td>
-                    <td className="num">{n(s.protected_in_inbox)}</td>
+                    <td className="num">{s.protected_in_inbox == null ? "—" : n(s.protected_in_inbox)}</td>
                     <td className="num">{n(s.unread)}</td>
                     <td>{s.last_date}</td>
                     <td><button className="btn btn-link small" onClick={() => onProtect(s.sender)}>Always protect</button></td>

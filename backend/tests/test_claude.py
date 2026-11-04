@@ -117,8 +117,9 @@ def test_injection_fixtures_are_sent_as_escaped_data(db, scanned):
     clf, client = make(db, labeller())
     ai_run.run(db, clf, _new_run(db), "you@sift-demo.test")
     sent = "".join(c["messages"][0]["content"] for c in client.calls)
-    assert "Ignore previous instructions" in sent           # the injection reached the model only as data...
-    assert "<<admin>>" not in sent and "\\u003c\\u003cadmin" in sent  # ...with its brackets escaped
+    assert "Ignore previous instructions" in sent  # unprotected injections reach the model only as data
+    assert "<<admin>>" not in sent                  # raw brackets never appear in the data block
+    assert "delete receipts" not in sent             # protected subjects (receipt pattern) are never sent at all
     assert all(c["system"] == SYSTEM_PROMPT for c in client.calls)
     assert all("tools" not in c for c in client.calls)  # Claude is never given tools
 
@@ -363,3 +364,70 @@ def test_top_senders_view_cannot_be_saved(ai_app):
     c, *_ = ai_app
     r = c.post("/api/query/save", json={"spec": {**SPEC, "mode": "top_senders"}})
     assert r.status_code == 400
+
+
+
+# --- regressions from the Phase 3 safety review ---------------------------------------------------------
+def test_protected_subjects_never_sent(db, scanned):
+    with db.connect() as c:
+        prot = {r[0] for r in c.execute("SELECT subject FROM messages WHERE protected=1 AND is_sent=0")}
+        unprot = {r[0] for r in c.execute("SELECT subject FROM messages WHERE protected=0 AND is_sent=0")}
+    only_protected = prot - unprot
+    sent = {s for g in ai_run.candidates(db) for s in g.subjects}
+    assert only_protected and not (sent & only_protected)
+
+
+def test_api_error_mid_run_keeps_labels_already_paid_for(db, scanned):
+    import anthropic, httpx2
+    def respond(kw):
+        if kw["model"] == "claude-opus-5-5":
+            raise anthropic.InternalServerError("overloaded", response=httpx2.Response(529, request=httpx2.Request("POST", "https://x")), body=None)
+        return labeller(conf=0.4)(kw)
+    clf, _ = make(db, respond)
+    status = ai_run.run(db, clf, _new_run(db), "you@sift-demo.test")
+    assert status == "completed"
+    with db.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM ai_labels").fetchone()[0] > 0
+        assert "InternalServerError" in (c.execute("SELECT error FROM ai_runs").fetchone()[0] or "")
+
+
+def test_cap_reserves_full_max_tokens(db, scanned):
+    from sift.ai.ledger import cost
+    clf, client = make(db, labeller(), cap=cost("claude-haiku-4-5", 3000, 1000))  # below one worst-case call
+    ai_run.run(db, clf, _new_run(db), "you@sift-demo.test")
+    assert client.calls == []  # refused before spending, rather than overshooting
+
+
+def test_dated_model_id_priced_correctly(db):
+    led = Ledger(db, 5)
+    usage = SimpleNamespace(input_tokens=1_000_000, output_tokens=0, cache_read_input_tokens=0,
+                            cache_creation_input_tokens=0)
+    assert led.record(run_id=None, purpose="x", model="claude-haiku-4-5-20251001", usage=usage, ok=True) == 1.0
+
+
+def test_claude_cannot_quietly_downgrade_keep_to_disposable(db, scanned):
+    clf, _ = make(db, labeller(category_for=lambda g: "job_alerts", conf=0.99))
+    with db.connect() as c:
+        rules_cat = c.execute("SELECT category FROM sender_groups WHERE sender='applications@greenroster.io'").fetchone()[0]
+    assert rules_cat == "employment"
+    ai_run.run(db, clf, _new_run(db), "you@sift-demo.test")
+    with db.connect() as c:
+        g = c.execute("SELECT category, reason FROM sender_groups WHERE sender='applications@greenroster.io'").fetchone()
+    assert g["category"] == "uncertain" and "Your call" in g["reason"]
+
+
+@pytest.mark.parametrize("spec", [
+    {**SPEC, "categories": [], "subject_excludes_any": [], "older_than_days": 0},
+    {**SPEC, "categories": ["uncertain"], "subject_excludes_any": []},
+    {**SPEC, "categories": [], "unread_only": True},
+])
+def test_overbroad_specs_rejected(spec):
+    with pytest.raises(SpecError):
+        parse_spec(spec)
+
+
+def test_review_suggestion_saved_as_review(ai_app):
+    c, state, _ = ai_app
+    rid = c.post("/api/query/save", json={"spec": {**SPEC, "suggested_action": "review"}}).json()["id"]
+    r = c.post("/api/plans", json={"items": [{"rec_id": rid}]})
+    assert r.status_code == 400 and "review-only" in r.json()["detail"]

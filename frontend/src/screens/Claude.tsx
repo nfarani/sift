@@ -34,7 +34,7 @@ export default function Claude({ go }: { go: (r: string) => void }) {
       <div className="page-head">
         <div>
           <h1>Claude classification</h1>
-          <p className="muted">Claude sorts the senders the rules couldn't. Protection rules always run first and always win.</p>
+          <p className="muted">Claude re-checks every sender the rules didn't firmly settle, including ones they may have misfiled. Senders you've corresponded with and mostly-protected bank/security senders are never sent. Protection rules always run first and always win, and Claude can't downgrade mail the rules wanted kept without asking you.</p>
         </div>
       </div>
 
@@ -65,7 +65,7 @@ export default function Claude({ go }: { go: (r: string) => void }) {
           <table className="table"><tbody>
             <tr><td>Senders labelled by Claude</td><td className="num">{n(run.groups_done)} of {n(run.groups_total)}</td></tr>
             <tr><td>Got a second opinion from the stronger model</td><td className="num">{n(run.groups_reviewed)}</td></tr>
-            <tr><td>Rejected by validation (kept rules label)</td><td className="num">{n(run.groups_failed)}</td></tr>
+            <tr><td>First-pass batches rejected or failed (kept rules label)</td><td className="num">{n(run.groups_failed)}</td></tr>
             <tr><td>Cost</td><td className="num"><strong>{usd(run.cost_usd)}</strong> <span className="muted">(cap {usd(run.cap_usd)}, estimated {usd(run.estimate.usd)})</span></td></tr>
           </tbody></table>
           {run.status === "stopped_at_cap" && <div className="notice notice-cap">Stopped at your spend cap. Unlabelled senders keep their rules label; run again later to continue (labels so far are kept and not paid for twice).</div>}
@@ -76,7 +76,7 @@ export default function Claude({ go }: { go: (r: string) => void }) {
 
       {st.available && !running && (
         <section className="card">
-          <h2>Run Claude on unsettled senders</h2>
+          <h2>Run Claude</h2>
           {!est ? (
             <>
               <p className="muted">First, Sift estimates the cost on this Mac. Nothing is sent to Anthropic until you approve.</p>
@@ -92,7 +92,7 @@ export default function Claude({ go }: { go: (r: string) => void }) {
                 <tr><td>Second opinion · <code>{est.review.model}</code> <span className="muted">(assumes {Math.round(est.review_share_assumed * 100)}% need it)</span></td><td className="num">{n(est.review.requests)} requests · {n(est.review.input_tokens)} in / {n(est.review.output_tokens)} out · {usd(est.review.usd)}</td></tr>
                 <tr><td><strong>Estimated total</strong></td><td className="num"><strong>{usd(est.usd)}</strong> <span className="muted">· your cap {usd(est.cap_usd)}</span></td></tr>
               </tbody></table>
-              <p className="muted small" style={{ marginTop: 10 }}>Sent per sender: {est.sends}. Estimates are conservative; the run stops at the cap regardless.</p>
+              <p className="muted small" style={{ marginTop: 10 }}>Sent per sender: {est.sends}. Subjects and snippets come only from unprotected messages. Estimates are conservative; the run stops before any request that could cross the cap.</p>
               {est.usd > est.cap_usd && (
                 <div className="notice notice-warn" style={{ marginTop: 12 }}>
                   The full run is over your cap. Running within the cap covers the biggest <strong>{n(est.within_cap.groups)}</strong> senders

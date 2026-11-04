@@ -78,6 +78,7 @@ Phase 2 gate **PASSED** on 2026-11-04. Next: `/phase-3` (waits for Nick).
 11. Executor.run()/restore() should call `_require_writer()` themselves (defence in depth).
 12. Disconnect/startup should survive a corrupt Keychain entry (load raises before delete).
 13. Exact RFC 8058 parsing for one-click unsubscribe before building unsubscribe.
+14. (Phase 3 review) Executor doesn't recheck the local category or `unread_only` against the plan item. A Claude run or reclassification between approval and execution doesn't stop the plan. Fix: revalidate category/UNREAD, or block execution when an AI run finished after approval.
 Done early: (P4-a) a capped test scan can't back a cleanup run (`test_capped_test_scan_cannot_drive_cleanup`).
 
 **Other**

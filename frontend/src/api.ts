@@ -93,7 +93,7 @@ export interface SenderRow {
   in_inbox: number;
   unread: number;
   eligible: number;
-  protected_in_inbox: number;
+  protected_in_inbox: number | null;
   excluded: boolean;
   first_date: string | null;
   last_date: string | null;

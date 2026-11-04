@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Request
@@ -399,9 +400,9 @@ def create_app(state: State) -> FastAPI:
         with db.connect() as c:
             inbox = c.execute("SELECT COUNT(*) FROM messages WHERE is_sent=0 AND in_inbox=1").fetchone()[0]
         senders = [{"sender": x["sender"], "display_name": x["display_name"], "total": x["n"], "in_inbox": x["n"],
-                    "unread": x["unread"], "eligible": x["n"], "protected_in_inbox": 0, "excluded": x["sender"] in excl,
+                    "unread": x["unread"], "eligible": x["n"], "protected_in_inbox": None, "excluded": x["sender"] in excl,
                     "first_date": _ms_to_iso(x["first"]), "last_date": _ms_to_iso(x["last"]), "list_id": None,
-                    "has_unsub": 0, "one_click_unsub": 0, "confidence": None, "reason": None} for x in pv["senders"]]
+                    "has_unsub": None, "one_click_unsub": None, "confidence": None, "reason": None} for x in pv["senders"]]
         return {**dict(rec), "spec": spec.to_dict(), "category_label": "Your request", "older_than_days": older,
                 "count": pv_ex["count"], "sender_count": len(senders), "senders": senders,
                 "exceptions": [{"reason": "protected (receipts, bookings, security, starred, your threads)",
@@ -575,13 +576,11 @@ def create_app(state: State) -> FastAPI:
         if spec.mode != "messages":
             bad("only message filters can be saved as recommendations")
         with db.connect() as c:
-            n = c.execute("SELECT COUNT(*) FROM recommendations WHERE source='query'").fetchone()[0]
-            rid = f"q{int(time.time())}{n}"
+            rid = f"q{uuid.uuid4().hex[:12]}"
             c.execute("INSERT INTO recommendations(id,category,title,action,older_than_days,reason,confidence,"
                       "classifier,created_at,spec,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                      (rid, "custom", spec.title or "Your request",
-                       "trash" if spec.suggested_action == "trash" else "archive", 0,
-                       spec.explanation or "Saved from your request.", 1.0, "you + Claude", now_iso(),
+                      (rid, "custom", spec.title or "Your request", spec.suggested_action, 0,
+                       spec.explanation or "Saved from your request.", 1.0, "saved request", now_iso(),
                        json.dumps(spec.to_dict()), "query"))
         return {"id": rid}
 

@@ -96,6 +96,11 @@ def classify(db: Database, classifier: Classifier, groups: list[SenderGroup]) ->
             if a is not None and cl.category != "personal" and a["category"] in CATEGORIES:
                 label, conf, reason, source = a["category"], a["confidence"], a["reason"], f"claude:{a['model']}"
                 exceptions = json.loads(a["exceptions"])
+                if cl.category in KEEP and label in DISPOSABLE:
+                    # Claude may not quietly downgrade something the rules wanted kept: you decide.
+                    reason = (f"Rules said {CATEGORIES[cl.category].lower()}, Claude suggested "
+                              f"{CATEGORIES[label].lower()} ({a['reason']}). Your call.")
+                    label, conf = "uncertain", min(conf, 0.5)
             c.execute("UPDATE sender_groups SET category=?, confidence=?, reason=?, classifier=? WHERE sender=?",
                       (label, conf, reason, source, sender))
             c.execute("UPDATE messages SET category=? WHERE from_addr=? AND is_sent=0", (label, sender))

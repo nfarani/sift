@@ -86,9 +86,10 @@ def parse_spec(d: dict) -> Spec:
         raise SpecError("suggested_action must be archive, trash or review")
     s.explanation = str(d.get("explanation", ""))[:500]
     s.not_supported = [str(x)[:200] for x in (d.get("not_supported") or [])][:10]
-    if not (s.categories or s.sender_contains or s.subject_contains_any or s.older_than_days is not None
-            or s.newer_than_days is not None or s.unread_only or s.mode == "top_senders"):
-        raise SpecError("the filter is empty; it would match your whole inbox")
+    narrowing = ([c for c in s.categories if c != "uncertain"] or s.sender_contains or s.subject_contains_any)
+    if s.mode == "messages" and not narrowing:
+        # Age, unread and "needs review" alone would sweep up most of the inbox, including mail nobody sorted.
+        raise SpecError("add a category, sender or subject to narrow the filter; it would match too much of your inbox")
     return s
 
 
