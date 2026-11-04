@@ -11,6 +11,8 @@ import History from "./screens/History";
 import Account from "./screens/Account";
 import Connect from "./screens/Connect";
 import Claude from "./screens/Claude";
+import Cleanup from "./screens/Cleanup";
+import Unsubscribe from "./screens/Unsubscribe";
 
 const NAV: [string, string][] = [
   ["overview", "Overview"],
@@ -19,6 +21,7 @@ const NAV: [string, string][] = [
   ["recommendations", "Recommendations"],
   ["confirm", "Confirm"],
   ["history", "Runs"],
+  ["unsubscribe", "Unsubscribe"],
   ["account", "Account"],
 ];
 
@@ -29,7 +32,7 @@ export default function App() {
   useEffect(() => saveSelection(selection), [selection]);
 
   const [page, arg] = route.split("/");
-  const active = page === "run" ? "history" : page;
+  const active = page === "run" ? "history" : page === "cleanup" ? "account" : page;
 
   return (
     <div className="shell">
@@ -49,7 +52,9 @@ export default function App() {
         <div className="status-chips">
           {status?.synthetic && <span className="chip chip-synthetic" title="Synthetic mailbox for development. Nothing here is real mail.">Synthetic data</span>}
           {status && !status.synthetic && status.connection.state === "connected" && (
-            <span className="chip chip-live" title={status.mode}>Gmail · {status.can_modify ? "cleanup enabled" : "read-only"}</span>
+            <a href="#/cleanup" className="chip chip-live" title={status.mode}>
+              Gmail · {status.cleanup.state === "enabled" ? "cleanup enabled" : status.cleanup.state === "reauth_required" ? "reconnect cleanup" : "read-only"}
+            </a>
           )}
           {status && (
             <span className={`chip ${status.classifier.uses_ai ? "chip-ai" : "chip-rules"}`}
@@ -62,14 +67,16 @@ export default function App() {
       </header>
       <main>
         {status && status.connection.state !== "connected" && page !== "account" ? <Connect status={status} onChange={reloadStatus} /> : <>
-        {page === "overview" && <Overview go={go} />}
+        {page === "overview" && <Overview go={go} status={status} />}
         {page === "scan" && <ScanScreen go={go} synthetic={!!status?.synthetic} />}
-        {page === "recommendations" && <Recommendations selection={selection} setSelection={setSelection} go={go} ai={status?.ai ?? { available: false, reason: null }} />}
+        {page === "recommendations" && <Recommendations selection={selection} setSelection={setSelection} go={go} ai={status?.ai ?? { available: false, reason: null }} status={status} />}
         {page === "confirm" && <Confirm selection={selection} status={status} go={go} />}
         {page === "run" && arg && <RunScreen runId={Number(arg)} go={go} onChange={reloadStatus} status={status} />}
         {page === "history" && <History go={go} />}
         {page === "claude" && <Claude go={go} />}
-        {page === "account" && <Account status={status} onChange={reloadStatus} />}
+        {page === "account" && <Account status={status} onChange={reloadStatus} go={go} />}
+        {page === "cleanup" && <Cleanup status={status} onChange={reloadStatus} go={go} />}
+        {page === "unsubscribe" && <Unsubscribe key={arg ?? "list"} status={status} go={go} batchId={arg ? Number(arg) : undefined} />}
         </>}
       </main>
       <footer className="foot">

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, Recommendation } from "../api";
+import { api, Recommendation, Status } from "../api";
 import { usePoll } from "../hooks";
 import { AGE_OPTIONS, ageLabel, day, n, pct, plural } from "../format";
 import { RecChoice, Selection } from "../selection";
@@ -9,9 +9,13 @@ interface RecsResponse { classifier: { label: string; uses_ai: boolean; ai_group
 interface Props {
   selection: Selection; setSelection: (f: (s: Selection) => Selection) => void; go: (r: string) => void;
   ai: { available: boolean; reason: string | null };
+  status: Status | null;
 }
 
-export default function Recommendations({ selection, setSelection, go, ai }: Props) {
+export default function Recommendations({ selection, setSelection, go, ai, status }: Props) {
+  // Until full runs unlock, the backend runs exactly one recommendation, capped. The picker behaves like a radio.
+  const locked = !!status && !status.full_runs_unlocked;
+  const cap = status?.first_run_cap ?? 0;
   const { data, error, reload } = usePoll(() => api.get<RecsResponse>("/recommendations"), null);
   const [previews, setPreviews] = useState<Record<string, Recommendation>>({});
   const [catFilter, setCatFilter] = useState("all");
@@ -23,7 +27,13 @@ export default function Recommendations({ selection, setSelection, go, ai }: Pro
     selection[r.id] ?? { selected: false, action: r.action === "trash" ? "trash" : "archive", older_than_days: r.older_than_days, excluded_senders: [] };
 
   const update = (r: Recommendation, patch: Partial<RecChoice>) =>
-    setSelection((s) => ({ ...s, [r.id]: { ...choiceFor(r), ...patch } }));
+    setSelection((s) => {
+      const next = { ...s, [r.id]: { ...choiceFor(r), ...patch } };
+      if (locked && patch.selected) {
+        for (const k of Object.keys(next)) if (k !== r.id && next[k].selected) next[k] = { ...next[k], selected: false };
+      }
+      return next;
+    });
 
   // Re-count on the server whenever age or exclusions differ from the defaults.
   const timers = useRef<Record<string, number>>({});
@@ -90,6 +100,19 @@ export default function Recommendations({ selection, setSelection, go, ai }: Pro
 
       <Ask available={ai.available} reason={ai.reason} onSaved={() => { setPreviews({}); reload(); }} />
 
+      {locked && (
+        <div className="notice notice-cap" role="note">
+          <strong>First run: {n(cap)} messages from one recommendation.</strong> Pick one. Sift changes at most {n(cap)} of its messages,
+          then you check them in Gmail and restore them to prove recovery works. Full runs, with several recommendations at once, unlock after that.
+        </div>
+      )}
+      {status && !status.synthetic && status.cleanup.state !== "enabled" && (
+        <div className="notice notice-row">
+          <span>Read-only: you can build and review a plan, but running it needs cleanup enabled.</span>
+          <button className="btn btn-ghost btn-sm" onClick={() => go("cleanup")}>{status.cleanup.state === "reauth_required" ? "Reconnect cleanup" : "Enable cleanup…"}</button>
+        </div>
+      )}
+
       <div className="filters">
         <label>Category
           <select value={catFilter} onChange={(e) => setCatFilter(e.target.value)}>
@@ -126,7 +149,7 @@ export default function Recommendations({ selection, setSelection, go, ai }: Pro
       {items.map((r) =>
         r.action === "review"
           ? <ReviewCard key={r.id} rec={r} onProtect={protectSender} />
-          : <RecCard key={r.id} rec={r} choice={choiceFor(r)} onChange={(p) => update(r, p)} onProtect={protectSender} senderQ={senderQ}
+          : <RecCard key={r.id} rec={r} choice={choiceFor(r)} single={locked} onChange={(p) => update(r, p)} onProtect={protectSender} senderQ={senderQ}
               onRemove={r.source === "query" ? async () => { await api.del(`/recommendations/${r.id}`); setSelection((s) => { const x = { ...s }; delete x[r.id]; return x; }); reload(); } : undefined} />,
       )}
 
@@ -134,8 +157,10 @@ export default function Recommendations({ selection, setSelection, go, ai }: Pro
         <div>
           <strong>{plural(selectedCount, "message")}</strong> selected across {plural(selected.length, "recommendation")}
           <span className="muted"> · protected mail is always excluded</span>
+          {locked && selected.length === 1 && selectedCount > cap && <span className="muted"> · first run changes {n(cap)} of them</span>}
+          {locked && selected.length > 1 && <div className="bad small">First run takes exactly one recommendation. Unselect {plural(selected.length - 1, "recommendation")}.</div>}
         </div>
-        <button className="btn btn-primary" disabled={selected.length === 0 || selectedCount === 0} onClick={() => go("confirm")}>
+        <button className="btn btn-primary" disabled={selected.length === 0 || selectedCount === 0 || (locked && selected.length > 1)} onClick={() => go("confirm")}>
           Review plan
         </button>
       </div>
@@ -143,8 +168,8 @@ export default function Recommendations({ selection, setSelection, go, ai }: Pro
   );
 }
 
-function RecCard({ rec, choice, onChange, onProtect, senderQ, onRemove }: {
-  rec: Recommendation; choice: RecChoice; onChange: (p: Partial<RecChoice>) => void;
+function RecCard({ rec, choice, single, onChange, onProtect, senderQ, onRemove }: {
+  rec: Recommendation; choice: RecChoice; single: boolean; onChange: (p: Partial<RecChoice>) => void;
   onProtect: (s: string) => void; senderQ: string; onRemove?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -157,7 +182,8 @@ function RecCard({ rec, choice, onChange, onProtect, senderQ, onRemove }: {
     <article className={`rec ${choice.selected ? "rec-on" : ""}`}>
       <div className="rec-head">
         <label className="check">
-          <input type="checkbox" checked={choice.selected} onChange={(e) => onChange({ selected: e.target.checked })} />
+          <input type="checkbox" checked={choice.selected} onChange={(e) => onChange({ selected: e.target.checked })}
+            aria-label={single ? `Use ${rec.title} for the first run` : `Select ${rec.title}`} />
           <span />
         </label>
         <div className="rec-title">
@@ -223,7 +249,7 @@ function RecCard({ rec, choice, onChange, onProtect, senderQ, onRemove }: {
               {(rec.unsubscribe_one_click > 0 || rec.unsubscribe_manual > 0) && (
                 <p className="muted small">
                   Unsubscribe: {n(rec.unsubscribe_one_click)} senders support one-click, {n(rec.unsubscribe_manual)} are manual only.
-                  Unsubscribing arrives in a later phase and always needs separate approval.
+                  Unsubscribing is separate: use <a href="#/unsubscribe">Unsubscribe</a>, which has its own approval.
                 </p>
               )}
             </div>

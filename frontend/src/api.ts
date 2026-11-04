@@ -34,6 +34,8 @@ export interface Status {
   provider: string;
   connection: { state: "disconnected" | "connecting" | "connected" | "reauth_required" | "error"; error: string | null };
   can_modify: boolean;
+  // Reported from what is actually attached. Synthetic mode always reports enabled.
+  cleanup: { state: CleanupState; error: string | null };
   client_secrets_present: boolean | null;
   credential_store: string | null;
   synthetic: boolean;
@@ -46,6 +48,53 @@ export interface Status {
   full_runs_unlocked: boolean;
   busy: boolean;
   mode: string;
+}
+
+export type CleanupState = "disabled" | "enabling" | "enabled" | "error" | "reauth_required";
+
+export interface CleanupDisableResult {
+  revoked_at_google: boolean;
+  local_writer_token_deleted: boolean;
+  problems: string[];
+  note: string;
+  status: Status;
+}
+
+export type UnsubMethod = "one_click" | "manual" | "none";
+
+/** One frozen batch item. The backend never sends the one-click URL itself, only its host. */
+export interface UnsubItem {
+  sender: string;
+  message_id: string | null;
+  method: UnsubMethod;
+  host: string | null;
+  mailto: string | null;
+  reason: string;
+}
+
+export interface UnsubLogRow {
+  ts: string;
+  batch_id?: number | null;
+  sender: string;
+  method: "one_click" | "manual";
+  url_host: string | null;
+  status_code: number | null;
+  outcome: string; // attempted | confirmed | not_confirmed | failed | refused | simulated | manual
+  detail: string;
+}
+
+export interface UnsubBatch {
+  id: number;
+  status: "draft" | "approved" | "running" | "completed" | "failed" | "cancelled";
+  created_at: string;
+  approved_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  items: UnsubItem[];
+  items_hash: string;
+  error: string | null;
+  counts: Record<UnsubMethod, number>;
+  log: UnsubLogRow[];
 }
 
 export interface CategoryRow { category: string; label: string; total: number; inbox: number; unread: number; protected: number; keep: boolean }

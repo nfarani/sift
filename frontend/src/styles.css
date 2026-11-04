@@ -274,3 +274,20 @@ select:focus, input:focus { outline: 2px solid var(--accent-soft); border-color:
 .src { font-size: 11px; color: var(--muted); }
 .src-claude { color: var(--accent); }
 @media (max-width: 900px) { .spec-grid { grid-template-columns: 1fr 1fr; } }
+
+/* phase 4: cleanup, first run, unsubscribe */
+.notice-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+.notice-row > span { flex: 1; min-width: 240px; }
+.explain p { color: var(--ink-2); }
+.explain-list { margin: 0; padding-left: 20px; color: var(--ink-2); }
+.explain-list li { margin: 6px 0; }
+.pill-none { background: var(--line-2); color: var(--ink-2); }
+a.chip { text-decoration: none; }
+a.chip:hover { border-color: currentColor; }
+
+/* visible keyboard focus everywhere */
+.btn:focus-visible, a:focus-visible, .chip-btn:focus-visible,
+input[type="checkbox"]:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.btn-primary:focus-visible { box-shadow: 0 0 0 4px var(--accent-soft); }

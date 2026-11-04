@@ -1,9 +1,9 @@
-import { api, Dashboard, Scan } from "../api";
+import { api, Dashboard, Scan, Status } from "../api";
 import { usePoll } from "../hooks";
 import { n, pct } from "../format";
 import { ScanChoice } from "./ScanScreen";
 
-export default function Overview({ go }: { go: (r: string) => void }) {
+export default function Overview({ go, status }: { go: (r: string) => void; status: Status | null }) {
   const { data: d, error } = usePoll(() => api.get<Dashboard>("/dashboard"), null);
   const { data: scan } = usePoll(() => api.get<Scan>("/scan"), null);
 
@@ -44,6 +44,8 @@ export default function Overview({ go }: { go: (r: string) => void }) {
           <button className="btn btn-primary" onClick={() => go("recommendations")}>Review recommendations</button>
         </div>
       </div>
+
+      {status && <CleanupBanner status={status} go={go} />}
 
       <div className="stats">
         <Stat label="In your inbox" value={n(d.inbox)} />
@@ -90,6 +92,26 @@ export default function Overview({ go }: { go: (r: string) => void }) {
           </table>
         </section>
       </div>
+    </div>
+  );
+}
+
+/** Gmail only: synthetic mode reports cleanup as enabled, so this never shows there. */
+export function CleanupBanner({ status, go }: { status: Status; go: (r: string) => void }) {
+  const st = status.cleanup.state;
+  if (status.synthetic || st === "enabled") return null;
+  const text = st === "reauth_required" ? "The cleanup permission expired. Scanning still works; reconnect cleanup to change mail."
+    : st === "enabling" ? "Waiting for you to finish Google's cleanup consent in the other tab."
+    : st === "error" ? `Enabling cleanup failed: ${status.cleanup.error ?? "unknown error"}`
+    : "Sift is read-only. You can review recommendations and plans, but nothing can change until you enable cleanup.";
+  return (
+    <div className={`notice ${st === "error" || st === "reauth_required" ? "notice-warn" : ""} notice-row`}>
+      <span>{text}</span>
+      {st !== "enabling" && (
+        <button className="btn btn-ghost btn-sm" onClick={() => go("cleanup")}>
+          {st === "reauth_required" ? "Reconnect cleanup" : "Enable cleanup…"}
+        </button>
+      )}
     </div>
   );
 }

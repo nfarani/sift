@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api, Status } from "../api";
 
-export default function Account({ status, onChange }: { status: Status | null; onChange: () => void }) {
+export default function Account({ status, onChange, go }: { status: Status | null; onChange: () => void; go: (r: string) => void }) {
   const [confirming, setConfirming] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -30,6 +30,20 @@ export default function Account({ status, onChange }: { status: Status | null; o
             <tr><td>Account</td><td>{status.account ?? "not connected"}</td></tr>
             <tr><td>Connection</td><td><span className={`status status-${connected ? "completed" : status.connection.state === "error" || status.connection.state === "reauth_required" ? "failed" : "cancelled"}`}>{status.connection.state.replace("_", " ")}</span></td></tr>
             <tr><td>Access</td><td>{status.mode}</td></tr>
+            {connected && (
+              <tr><td>Cleanup (gmail.modify)</td><td>
+                <span className={`status status-${status.cleanup.state === "enabled" ? "completed" : status.cleanup.state === "error" || status.cleanup.state === "reauth_required" ? "failed" : status.cleanup.state === "enabling" ? "running" : "cancelled"}`}>
+                  {status.cleanup.state.replace("_", " ")}
+                </span>{" "}
+                {!status.synthetic && (
+                  <button className="btn btn-link small" onClick={() => go("cleanup")}>
+                    {status.cleanup.state === "enabled" ? "Manage or disable" : status.cleanup.state === "reauth_required" ? "Reconnect cleanup" : "Enable cleanup…"}
+                  </button>
+                )}
+                {status.cleanup.error && <div className="small bad">{status.cleanup.error}</div>}
+              </td></tr>
+            )}
+            <tr><td>Full runs</td><td>{status.full_runs_unlocked ? "unlocked" : `locked: first run is capped at ${status.first_run_cap} messages from one recommendation, then restored`}</td></tr>
             {status.credential_store && <tr><td>Credentials stored in</td><td>{status.credential_store} (never in the project folder, logs or this page)</td></tr>}
             <tr><td>AI classification</td><td>{status.classifier.label}</td></tr>
           </tbody>

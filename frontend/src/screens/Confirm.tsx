@@ -7,22 +7,24 @@ const ACTION_LABEL: Record<string, string> = { archive: "Archive + label", trash
 
 export default function Confirm({ selection, status, go }: { selection: Selection; status: Status | null; go: (r: string) => void }) {
   const [plan, setPlan] = useState<Plan | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [buildErr, setBuildErr] = useState<string | null>(null);
+  const [actionErr, setActionErr] = useState<string | null>(null); // shown verbatim next to the button
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [rebuild, setRebuild] = useState(0);
 
   const items = Object.entries(selection)
     .filter(([, c]) => c.selected)
     .map(([rec_id, c]) => ({ rec_id, action: c.action, older_than_days: c.older_than_days, excluded_senders: c.excluded_senders }));
-  const key = JSON.stringify(items);
+  const key = JSON.stringify([items, rebuild]);
 
   // One draft per distinct selection (StrictMode re-runs effects; don't create duplicate drafts).
   const built = useRef<string | null>(null);
   useEffect(() => {
     if (items.length === 0 || built.current === key) return;
     built.current = key;
-    setPlan(null); setErr(null); setAck(false);
-    api.post<Plan>("/plans", { items }).then(setPlan, (e) => setErr(e.message));
+    setPlan(null); setBuildErr(null); setActionErr(null); setAck(false);
+    api.post<Plan>("/plans", { items }).then(setPlan, (e) => setBuildErr(e.message));
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (items.length === 0) {
@@ -34,23 +36,32 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
       </section>
     );
   }
-  if (err) return <div className="stack narrow"><div className="notice notice-error">{err}</div><button className="btn btn-ghost" onClick={() => go("recommendations")}>Back</button></div>;
+  if (buildErr) return <div className="stack narrow"><div className="notice notice-error" role="alert">{buildErr}</div><button className="btn btn-ghost" onClick={() => go("recommendations")}>Back</button></div>;
   if (!plan || !status) return <div className="loading">Building the exact plan…</div>;
 
-  const capped = !status.full_runs_unlocked && plan.total > status.first_run_cap;
+  const locked = !status.full_runs_unlocked;
+  const tooMany = locked && plan.summary.items.length > 1;
+  const capped = locked && plan.total > status.first_run_cap;
   const thisRun = capped ? status.first_run_cap : plan.total;
   const hasTrash = (plan.summary.by_action.trash ?? 0) > 0;
+  const cleanupOn = status.cleanup.state === "enabled" && status.can_modify;
 
   const approveAndRun = async () => {
-    setBusy(true); setErr(null);
+    setBusy(true); setActionErr(null);
     try {
-      await api.post(`/plans/${plan.id}/approve`, { confirm_hash: plan.ids_hash });
+      // A plan is approved once. If approval succeeded but execution was refused, don't approve again.
+      if (plan.status === "draft") {
+        const approved = await api.post<Plan>(`/plans/${plan.id}/approve`, { confirm_hash: plan.ids_hash });
+        setPlan(approved);
+      }
       const run = await api.post<Run>(`/plans/${plan.id}/execute`);
       go(`run/${run.id}`);
     } catch (e) {
-      setErr((e as Error).message); setBusy(false);
+      setActionErr((e as Error).message); setBusy(false);
+      api.get<Plan>(`/plans/${plan.id}`).then(setPlan, () => undefined);
     }
   };
+  const newPlan = () => setRebuild((x) => x + 1);
 
   return (
     <div className="stack-lg narrow">
@@ -109,10 +120,17 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
         </ul>
       </section>
 
-      {capped && (
+      {tooMany && (
+        <div className="notice notice-error" role="alert">
+          <strong>First run: {n(status.first_run_cap)} messages from one recommendation.</strong> This plan has {plural(plan.summary.items.length, "recommendation")}.
+          Go back and keep only one; the backend refuses anything else until full runs are unlocked.
+        </div>
+      )}
+      {locked && !tooMany && (
         <div className="notice notice-cap">
-          <strong>First run is capped at {n(status.first_run_cap)} messages.</strong> This run will process {n(thisRun)} of {n(plan.total)}.
-          Check the result and restore it once to prove recovery works; then full runs unlock and the rest of this plan can run.
+          <strong>First run: up to {n(status.first_run_cap)} messages from one recommendation.</strong>{" "}
+          {capped ? <>This run will process {n(thisRun)} of the {n(plan.total)} in this plan.</> : <>This plan has {n(plan.total)}, so all of them run.</>}{" "}
+          Check the result in Gmail, then restore it to prove recovery works. After a successful restore you can unlock full runs.
         </div>
       )}
       {hasTrash && (
@@ -126,20 +144,29 @@ export default function Confirm({ selection, status, go }: { selection: Selectio
         Right before each batch, Sift re-checks every message: anything newly starred, replied to, or deleted is skipped. Nothing can be added.
       </div>
 
-      {!status.can_modify && (
-        <div className="notice notice-warn">
-          <strong>Read-only.</strong> Sift is connected with <code>gmail.readonly</code> and cannot change your mail.
-          You can review this plan; running it arrives with the "Enable cleanup" step in a later phase.
+      {!cleanupOn && (
+        <div className="notice notice-warn notice-row">
+          <span><strong>Read-only.</strong> Sift is connected with <code>gmail.readonly</code> and cannot change your mail.
+            You can review this plan; to run it, enable cleanup. Plans approved while read-only must be approved again afterwards.</span>
+          <button className="btn btn-ghost btn-sm" onClick={() => go("cleanup")}>{status.cleanup.state === "reauth_required" ? "Reconnect cleanup" : "Enable cleanup…"}</button>
         </div>
       )}
       <label className="ack">
         <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
         I've reviewed this plan. {status.synthetic ? "Apply it to the synthetic mailbox." : "Apply it to my mailbox."}
       </label>
+      {actionErr && (
+        <div className="notice notice-error notice-row" role="alert">
+          <span><strong>Sift refused to run this plan:</strong> {actionErr}</span>
+          <button className="btn btn-ghost btn-sm" onClick={newPlan}>Build a new plan</button>
+        </div>
+      )}
       <div className="row end">
         <button className="btn btn-ghost" onClick={() => go("recommendations")}>Edit selection</button>
-        <button className="btn btn-primary btn-lg" disabled={!ack || busy || !status.can_modify} onClick={approveAndRun}>
-          {busy ? "Starting…" : `Approve and run ${n(thisRun)} ${thisRun === 1 ? "change" : "changes"}`}
+        <button className="btn btn-primary btn-lg" disabled={!ack || busy || !cleanupOn || tooMany} onClick={approveAndRun}>
+          {busy ? "Starting…" : plan.status === "draft"
+            ? `Approve and run ${n(thisRun)} ${thisRun === 1 ? "change" : "changes"}`
+            : `Run ${n(thisRun)} ${thisRun === 1 ? "change" : "changes"} (plan ${plan.status})`}
         </button>
       </div>
     </div>
