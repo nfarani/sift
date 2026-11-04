@@ -131,3 +131,11 @@ def test_masks_with_digit_heavy_hashes_round_trip():
         assert MASKED.match(masked) and "#" not in masked, masked
         assert m.unmask(masked) == addr
     assert m.text("order 12345678 for a@b.example") .startswith("order #### for a***")
+
+
+def test_odd_sender_addresses_are_masked_and_round_trip():
+    from sift.demo import Masker
+    m = Masker()
+    out = m.mask({"sender": "**dhl-shipment**@spam.example"})["sender"]
+    assert "dhl-shipment" not in out and "***" in out
+    assert m.unmask(out) == "**dhl-shipment**@spam.example"

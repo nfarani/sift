@@ -31,6 +31,8 @@ class UnknownMasked(ValueError):
     """A masked address came back that this backend didn't hand out (e.g. after a restart)."""
 # JSON keys whose values are message content: replaced entirely.
 CONTENT_KEYS = {"subject", "snippet", "subjects", "snippets", "sample_subjects", "subject_contains"}
+# JSON keys whose values are always a sender address, even ones the address pattern wouldn't match.
+ADDRESS_KEYS = {"sender", "from_addr", "account", "excluded_senders", "senders"}
 # JSON keys whose values are display names.
 NAME_KEYS = {"display_name", "from_name"}
 
@@ -117,6 +119,8 @@ class Masker:
                 return HIDDEN if obj else obj
             if key in NAME_KEYS:
                 return self.name(obj)
+            if key in ADDRESS_KEYS and "@" in obj and not EMAIL.fullmatch(obj):
+                return self.address(obj)  # odd spam addresses like "**x**@example.com"
             return self.text(obj)
         return obj
 
