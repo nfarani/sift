@@ -1,5 +1,13 @@
 # Sift
 
+An AI inbox cleaner that sorted a 15-year-old Gmail inbox of 97,517 emails, with nothing changed until I approve it.
+
+**Case study:** [https://niccolas-farani.pages.dev/work/sift](https://niccolas-farani.pages.dev/work/sift/) · Built with Claude Code, Python/FastAPI, React and the Anthropic Claude API.
+
+![Sift preview](docs/media/preview.webp)
+
+---
+
 Sift is a local, terminal-launched app that cleans up a Gmail inbox you can no longer manage by hand. It scans
 message metadata, protects anything that looks like real correspondence or a record you'd need, uses Claude to
 classify the bulk senders that rules can't settle, and proposes explainable cleanup plans. It changes mail only
